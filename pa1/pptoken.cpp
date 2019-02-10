@@ -164,6 +164,22 @@ const unordered_set<int> SimpleEscapeSequence_CodePoints =
         '\'', '"', '?', '\\', 'a', 'b', 'f', 'n', 'r', 't', 'v'
     };
 
+const unordered_map<int, int> SimpleEscapeSequence_Map =
+    {
+        {'\'', 0x27},
+        {'"', 0x22},
+        {'?', 0x3f},
+        {'\\', 0x5c},
+        {'a', 0x07},
+        {'b', 0x08},
+        {'f', 0x0c},
+        {'n', 0x0a},
+        {'r', 0x0d},
+        {'t', 0x09},
+        {'v', 0x0b},
+    };
+
+
 const unordered_set<int> SingleCharacter_Op_or_Punc =
     {
         '{', '}', '[', ']', '#', '(', ')', ';', ':', '?', '.',
@@ -194,8 +210,21 @@ enum State {
   S_UserDefinedCharacterLiteral,
   S_StringLiteral,
   S_UserDefinedStringLiteral,
-
+  S_EncodingPrefiex,
 };
+
+enum StringState {
+  Inner_None,
+  Inner_BackSlash,
+  Inner_Hex,
+  Inner_Oct1,
+  Inner_Oct2,
+  Inner_Little_U,
+  Inner_Large_U,
+};
+
+
+static const char *missingStringTermintor = "unterminated string literal";
 
 struct Token {
   TokenType type;
@@ -212,6 +241,26 @@ static bool startsWith(const string &s, const string &prefix) {
   return strncmp(s.c_str(), prefix.c_str(), prefix.size()) == 0;
 }
 
+static bool isEncodingPrefix(const string &text) {
+  assert(!text.empty());
+  return startsWith(text, "u8") ||
+         (text.size() == 1 && (text[0] == 'u' || text[0] == 'U' || text[0] == 'L'));
+}
+
+static int str2int(const string &str, int base) {
+  if (str.empty()) {
+    return 0;
+  }
+  std::size_t pos;
+  int v = std::stoi(str, &pos, base);
+  ASSERT(pos == str.size(), "string must be converted to integer");
+  return v;
+}
+
+static inline bool is_hex(int c) {
+  return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
 // Tokenizer
 struct PPTokenizer {
   IPPTokenStream &output;
@@ -221,6 +270,11 @@ struct PPTokenizer {
       : output(output) {
     state_ = S_None;
     prev_token_type_ = Tk_Null;
+    string_inner_state_ = Inner_None;
+    expected_char_ = '\0';
+    is_raw_string_ = false;
+    is_prev_whitespace = false;
+    is_escape_ = false;
   }
 
   void process(int c) {
@@ -279,7 +333,10 @@ private:
 
     switch (state_) {
       case S_Id:
-          output.emit_identifier(data_);
+        output.emit_identifier(data_);
+        break;
+      case S_StringLiteral:
+        output.emit_string_literal(data_);
         break;
     }
 
@@ -290,22 +347,37 @@ private:
     }
   }
 
+  void emit_error(const char *msg) {
+    cerr << "ERROR: " << msg << endl;
+  }
+
   void process_None(int c) {
 
     ASSERT(data_.empty(), "buffer must be empty");
 
+    if (std::isspace(c) && c != 0x0A) {
+      if (!is_prev_whitespace) {
+        output.emit_whitespace_sequence();
+        is_prev_whitespace = true;
+      }
+      return;
+    }
+    is_prev_whitespace = false;
+
     if (c == EndOfFile) {
       output.emit_eof();
-    } else if (c == 0xA0) {
-      if (!data_.empty() && data_.back() == '\\') {
-
-      } else {
-
+    } else if (c == 0x0A) {
+      if (data_.empty() || data_.back() != '\\') {
+        output.emit_new_line();
       }
     } else if (c == '<' || c == '"') {
       // header-name
       state_ = S_HeaderName;
       data_.push_back(c);
+
+      if (saved_data_ != "include") {
+        state_ = S_StringLiteral;
+      }
     } else if ('.' == c || std::isdigit(c)) {
       // pp-number
       state_ = S_PPNumber;
@@ -321,9 +393,20 @@ private:
       data_.push_back(c);
     } else if (c == '\'') {
       ASSERT(!data_.empty(), "buffer length must greater than 0");
-      if (startsWith(data_, "u8") || data_[0] == 'u' || data_[0] == 'U' || data_[0] == 'L') {
+      if (isEncodingPrefix(data_)) {
         state_ = S_CharacterLiteral;
         data_.push_back(c);
+      } else {
+        emit(c, true);
+      }
+    } else if (c == '"' || c == 'R') {
+      ASSERT(expected_char_ == '\0', "expected character must be zero");
+      if (isEncodingPrefix(data_)) {
+        state_ = S_StringLiteral;
+        data_.push_back(c);
+        if (c == 'R') {
+          expected_char_ = '"';
+        }
       } else {
         emit(c, true);
       }
@@ -336,7 +419,7 @@ private:
 
     ASSERT(!data_.empty(), "buffer length must greater than 0");
 
-    if (c == 0xA0 || c == data_[0]) {
+    if (c == 0x0A || c == data_[0]) {
       emit(c, false);
     } else {
       data_.push_back(c);
@@ -348,6 +431,8 @@ private:
   }
 
   void process_character_literal(int c) {
+
+
     if (c == '\'') {
       data_.push_back(c);
       emit(c, false);
@@ -357,11 +442,130 @@ private:
 
   void process_string_literal(int c) {
 
+    if (is_raw_string_) {
+      process_raw_string_literal(c);
+    } else {
+      process_normal_string_literal(c);
+    }
   }
+
+  void process_normal_string_literal(int c) {
+
+    switch (string_inner_state_) {
+      case Inner_None:
+        if (c == 0x0A) {
+          emit_error(missingStringTermintor);
+        } else if (c == '\\') {
+          string_inner_state_ = Inner_BackSlash;
+        } else if (c == '\"') {
+          data_.push_back(c);
+          emit(c, false);
+        } else {
+          data_.push_back(c);
+        }
+        break;
+      case Inner_BackSlash:
+        ASSERT(c != 0x0A, "line ending character after back slash character cannot reach here");
+        if (SimpleEscapeSequence_CodePoints.find(c) != SimpleEscapeSequence_CodePoints.end()) {
+          data_.push_back(static_cast<char>(SimpleEscapeSequence_Map.at(c)));
+        } else if (c == 'u' || c == 'U') {
+          if (c == 'u') {
+            string_inner_state_ = Inner_Little_U;
+          } else {
+            string_inner_state_ = Inner_Large_U;
+          }
+          escaped_value_.clear();
+          hex_counts_ = 0;
+        } else if (c == 'x') {
+          string_inner_state_ = Inner_Hex;
+          escaped_value_.clear();
+        } else if (c >= '0' && c <= '7') {
+          string_inner_state_ = Inner_Oct1;
+          escaped_value_.clear();
+          escaped_value_.push_back(c);
+        } else {
+          data_.push_back(c);
+        }
+        break;
+      case Inner_Oct1:
+        if (c >= '0' && c <= '7') {
+          string_inner_state_ = Inner_Oct2;
+          escaped_value_.push_back(c);
+        } else {
+          string_inner_state_ = Inner_None;
+          char b = static_cast<char>(str2int(escaped_value_, 8));
+          escaped_value_.clear();
+          data_.push_back(b);
+        }
+        break;
+      case Inner_Oct2: {
+        bool cont = false;
+        if (c >= '0' && c <= '7') {
+          escaped_value_.push_back(c);
+        } else {
+          cont = true;
+        }
+        char b = static_cast<char>(str2int(escaped_value_, 8));
+        escaped_value_.clear();
+        data_.push_back(b);
+
+        string_inner_state_ = Inner_None;
+        if (cont) {
+          process_normal_string_literal(c);
+        }
+      }
+        break;
+
+      case Inner_Hex:
+        if (is_hex(c)) {
+          escaped_value_.push_back(c);
+        } else {
+          char h = static_cast<char>(str2int(escaped_value_, 16));
+          escaped_value_.clear();
+          data_.push_back(h);
+
+          string_inner_state_ = Inner_None;
+          process_normal_string_literal(c);
+        }
+        break;
+      case Inner_Little_U:
+        if (hex_counts_ == 4) {
+          
+        } else {
+
+        }
+        if (is_hex(c)) {
+
+        } else {
+
+        }
+        break;
+      case Inner_Large_U:
+
+        break;
+      default:
+        break;
+    }
+  }
+
+  void process_raw_string_literal(int c) {
+
+  }
+
 private:
   string data_;
   string saved_data_;
+
   TokenType prev_token_type_;
+  StringState string_inner_state_;
+
+  char expected_char_;
+  string escaped_value_;
+  int hex_counts_;
+
+  bool is_raw_string_;
+  bool is_escape_;
+  bool is_prev_whitespace;
 
   vector<Token> pending_tokens;
 
@@ -370,7 +574,7 @@ private:
 
 int main() {
 
-  freopen("/home/syl/git/myproject/cppgm/pa1/tests/100-a.t", "r", stdin);
+  freopen("/home/syl/git/myproject/cppgm/pa1/tests/100-string-literals.t", "r", stdin);
 
   try {
     ostringstream oss;
