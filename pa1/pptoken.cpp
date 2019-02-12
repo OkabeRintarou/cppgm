@@ -10,6 +10,7 @@
 #include <unordered_set>
 #include <string>
 #include <vector>
+#include <deque>
 
 using namespace std;
 
@@ -38,6 +39,7 @@ using namespace std;
 
 // EndOfFile: synthetic "character" to represent the end of source file
 constexpr int EndOfFile = -1;
+constexpr int LF = 0x0A;
 
 // given hex digit character c, return its value
 int HexCharToValue(int c) {
@@ -167,16 +169,16 @@ const unordered_set<int> SimpleEscapeSequence_CodePoints =
 const unordered_map<int, int> SimpleEscapeSequence_Map =
     {
         {'\'', 0x27},
-        {'"', 0x22},
-        {'?', 0x3f},
+        {'"',  0x22},
+        {'?',  0x3f},
         {'\\', 0x5c},
-        {'a', 0x07},
-        {'b', 0x08},
-        {'f', 0x0c},
-        {'n', 0x0a},
-        {'r', 0x0d},
-        {'t', 0x09},
-        {'v', 0x0b},
+        {'a',  0x07},
+        {'b',  0x08},
+        {'f',  0x0c},
+        {'n',  0x0a},
+        {'r',  0x0d},
+        {'t',  0x09},
+        {'v',  0x0b},
     };
 
 
@@ -211,6 +213,7 @@ enum State {
   S_StringLiteral,
   S_UserDefinedStringLiteral,
   S_EncodingPrefiex,
+  S_OpOrPunc,
 };
 
 enum StringState {
@@ -224,7 +227,9 @@ enum StringState {
 };
 
 
-static const char *missingStringTermintor = "unterminated string literal";
+static const char *kMissingStringTerminator = "unterminated string literal";
+static const char *kInvalidEscapeSequence = "invalid escape sequence";
+
 
 struct Token {
   TokenType type;
@@ -257,9 +262,44 @@ static int str2int(const string &str, int base) {
   return v;
 }
 
-static inline bool is_hex(int c) {
+static inline bool isHex(int c) {
   return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
+
+static string toUtf8(const string &text) {
+
+  int v = str2int(text, 16);
+  string str;
+
+  while (v > 0x7f) {
+
+  }
+
+
+  return str;
+}
+
+static int toCodePoint(const string &text) {
+  return 0;
+}
+
+static inline string littleU2Utf8(const string &text) {
+  ASSERT(text.size() == 4, "string length must be 4");
+  return toUtf8(text);
+}
+
+static inline string largeU2Utf8(const string &text) {
+  ASSERT(text.size() == 8, "string length must be 8");
+  string str;
+  str.append(toUtf8(text.substr(0, 4)));
+  str.append(toUtf8(text.substr(4, 4)));
+  return str;
+}
+
+static inline bool isUtf8Trailing(int c) {
+  return ((c >> 6) & 0x03) == 0x02;
+}
+
 
 // Tokenizer
 struct PPTokenizer {
@@ -271,6 +311,7 @@ struct PPTokenizer {
     state_ = S_None;
     prev_token_type_ = Tk_Null;
     string_inner_state_ = Inner_None;
+    decode_state_ = D_None;
     expected_char_ = '\0';
     is_raw_string_ = false;
     is_prev_whitespace = false;
@@ -282,33 +323,252 @@ struct PPTokenizer {
     // 1. do translation features
     // 2. tokenize resulting stream
     // 3. call an output.emit_* function for each token.
-    switch (state_) {
-      case S_None:
-        process_None(c);
-        break;
-      case S_Id:
-        process_Identifier(c);
-        break;
-      case S_HeaderName:
-        process_ppnumber(c);
-        break;
-      case S_CharacterLiteral:
-        process_character_literal(c);
-        break;
-      case S_StringLiteral:
-        process_string_literal(c);
-        break;
-      default:
-        break;
+
+    int cp;
+
+    if (decode(c)) {
+      cp = code_points_.front();
+      code_points_.pop_front();
+      step(cp);
     }
+
 
     // TIP: Reference implementation is about 1000 lines of code.
     // It is a state machine with about 50 states, most of which
     // are simple transitions of the operators.
+  }
 
+
+  void step(int cp) {
+    printf("%x\n", cp);
   }
 
 private:
+  enum DecodeState {
+    D_None,
+    D_UTF8,
+    D_LittleU,
+    D_LargeU,
+    D_ForwardSlash,
+    D_BackSlash,
+    D_MayBeTriGraph1,
+    D_MayBeTriGraph2,
+    D_SingleLineComment,
+    D_InlineComment,
+    D_MayEndInlineComment,
+  };
+private:
+
+  bool decode(int c) {
+
+    DecodeState s = decode_state_;
+    bool ret = false;
+
+    if (s == D_None) {
+
+      ASSERT(buffer_.empty(), "buffer must be empty");
+
+      if (c < 0x7f) {
+        if (c == '/') {
+          decode_state_ = D_ForwardSlash;
+        } else if (c == '\\') {
+          decode_state_ = D_BackSlash;
+        } else if (c == '?') {
+          decode_state_ = D_MayBeTriGraph1;
+        } else {
+          code_points_.push_back(c);
+          ret = true;
+        }
+      } else {
+        decode_state_ = D_UTF8;
+        counts_ = 0;
+
+        int shift = 7;
+        while ((shift >= 4) && ((c >> shift) & 0x01)) {
+          shift--;
+          counts_++;
+        }
+
+        if (shift < 3) {
+          throw "utf8 invalid unit (11111xx)";
+        } else if (shift > 5) {
+          throw "utf8 trailing code unit (10xxxxxx) at start";
+        } else {
+          --counts_;
+          ASSERT(buffer_.empty(), "buffer must be empty");
+          buffer_.push_back((char) (c & (~(0xff << shift))));
+        }
+      }
+    } else if (s == D_UTF8) {
+      // UTF-8 decoding
+
+      if (isUtf8Trailing(c)) {
+        ASSERT(counts_ > 0, "the count of remaining trailing bytes must be greater than 0");
+        buffer_.push_back((char) (c & 0x3f));
+        --counts_;
+        if (counts_ == 0) {
+
+          auto sz = buffer_.size(), shift = 6 * (sz - 1);
+          int code = (int) (buffer_.front()) << shift;
+
+          for (auto i = 1; i < sz; i++) {
+            shift -= 6;
+            code |= ((int) (buffer_[i]) << shift);
+          }
+          code_points_.push_back(code);
+          decode_state_ = D_None;
+          buffer_.clear();
+          ret = true;
+        }
+      } else {
+        throw "utf8 expected trailing byte (10xxxxxx)";
+      }
+    } else if (s == D_ForwardSlash) {
+      if (c == '/') {
+        // line comment
+        decode_state_ = D_SingleLineComment;
+        is_prev_back_slash_ = false;
+      } else if (c == '*') {
+        decode_state_ = D_InlineComment;
+      } else {
+        code_points_.push_back('/');
+        decode_state_ = D_None;
+        ret = decode(c);
+      }
+    } else if (s == D_BackSlash) {
+      if (c == LF) {
+        // line splicing
+      } else if (c == 'u') {
+        ASSERT(buffer_.empty(), "buffer must be empty");
+        decode_state_ = D_LittleU;
+      } else if (c == 'U') {
+        ASSERT(buffer_.empty(), "buffer must be empty");
+        decode_state_ = D_LargeU;
+      } else {
+        code_points_.push_back('\\');
+        decode_state_ = D_None;
+        ret = decode(c);
+      }
+    } else if (s == D_LittleU || s == D_LargeU) {
+      // universal character name decoding
+      if (isHex(c)) {
+        buffer_.push_back(c);
+        if (s == D_LittleU && buffer_.size() == 4) {
+          int cp = toCodePoint(buffer_);
+          code_points_.push_back(cp);
+          buffer_.clear();
+          ret = true;
+        } else if (s == D_LargeU && buffer_.size() == 8) {
+          // TODO: complete
+          buffer_.clear();
+          ret = true;
+        }
+      } else {
+        code_points_.push_back('\\');
+        if (s == D_LittleU) {
+          code_points_.push_back('u');
+        } else {
+          code_points_.push_back('U');
+        }
+        string buf(buffer_);
+        buffer_.clear();
+        decode_state_ = D_None;
+        for (const auto x : buf) {
+          decode(x);
+        }
+        decode(c);
+        ret = true;
+      }
+    } else if (s == D_MayBeTriGraph1) {
+      // tri-graph decoding
+      if (c == '?') {
+        decode_state_ = D_MayBeTriGraph2;
+      } else {
+        code_points_.push_back('?');
+        decode_state_ = D_None;
+        decode(c);
+        ret = true;
+      }
+    } else if (s == D_MayBeTriGraph2) {
+      int cp = -1;
+
+      switch (c) {
+        case '=':
+          cp = '#';
+          break;
+        case '/':
+          cp = '\\';
+          break;
+        case '\'':
+          cp = '^';
+          break;
+        case '(':
+          cp = '[';
+          break;
+        case ')':
+          cp = ']';
+          break;
+        case '!':
+          cp = ']';
+          break;
+        case '<':
+          cp = '{';
+          break;
+        case '>':
+          cp = '}';
+          break;
+        case '-':
+          cp = '~';
+          break;
+        default:
+          code_points_.push_back('?');
+          code_points_.push_back('?');
+          decode_state_ = D_None;
+          decode(c);
+          ret = true;
+          break;
+      }
+      if (cp != -1) {
+        code_points_.push_back(cp);
+        decode_state_ = D_None;
+        ret = true;
+      }
+
+    } else if (s == D_SingleLineComment) {
+      if (c == LF) {
+        if (is_prev_back_slash_) {
+          is_prev_back_slash_ = false;
+        } else {
+          decode_state_ = D_None;
+        }
+      } else if (c == '\\') {
+        is_prev_back_slash_ = true;
+      } else {
+        is_prev_back_slash_ = false;
+      }
+    } else if (s == D_InlineComment) {
+      if (c == '*') {
+        decode_state_ = D_MayEndInlineComment;
+      }
+    } else if (s == D_MayEndInlineComment) {
+      if (c == '/') {
+        decode_state_ = D_None;
+      } else {
+        decode_state_ = D_InlineComment;
+      }
+    } else {
+      ASSERT(false, "invalid statement");
+    }
+
+
+    // file terminating line-ending
+
+    if (!ret && !code_points_.empty()) {
+      ret = true;
+    }
+    return ret;
+  }
+
   void emit(int c, bool cont) {
 
     if (pending_tokens.size() == 1 && state_ == S_Id) {
@@ -349,6 +609,7 @@ private:
 
   void emit_error(const char *msg) {
     cerr << "ERROR: " << msg << endl;
+    exit(EXIT_FAILURE);
   }
 
   void process_None(int c) {
@@ -454,7 +715,7 @@ private:
     switch (string_inner_state_) {
       case Inner_None:
         if (c == 0x0A) {
-          emit_error(missingStringTermintor);
+          emit_error(kMissingStringTerminator);
         } else if (c == '\\') {
           string_inner_state_ = Inner_BackSlash;
         } else if (c == '\"') {
@@ -517,7 +778,7 @@ private:
         break;
 
       case Inner_Hex:
-        if (is_hex(c)) {
+        if (isHex(c)) {
           escaped_value_.push_back(c);
         } else {
           char h = static_cast<char>(str2int(escaped_value_, 16));
@@ -529,21 +790,32 @@ private:
         }
         break;
       case Inner_Little_U:
-        if (hex_counts_ == 4) {
-          
+        if (isHex(c)) {
+          escaped_value_.push_back(c);
+          ++hex_counts_;
+          if (hex_counts_ == 4) {
+            data_.append(littleU2Utf8(escaped_value_));
+            string_inner_state_ = Inner_None;
+          }
         } else {
-
+          emit_error(kInvalidEscapeSequence);
         }
-        if (is_hex(c)) {
 
-        } else {
-
-        }
         break;
       case Inner_Large_U:
-
+        if (isHex(c)) {
+          escaped_value_.push_back(c);
+          ++hex_counts_;
+          if (hex_counts_ == 8) {
+            data_.append(largeU2Utf8(escaped_value_));
+            string_inner_state_ = Inner_None;
+          } else {
+            emit_error(kInvalidEscapeSequence);
+          }
+        }
         break;
       default:
+        ASSERT(false, "invalid inner state");
         break;
     }
   }
@@ -555,6 +827,13 @@ private:
 private:
   string data_;
   string saved_data_;
+
+  string buffer_;
+  int counts_;
+  DecodeState decode_state_;
+  int code_point_;
+  deque<int> code_points_;
+  bool is_prev_back_slash_;
 
   TokenType prev_token_type_;
   StringState string_inner_state_;
@@ -574,7 +853,8 @@ private:
 
 int main() {
 
-  freopen("/home/syl/git/myproject/cppgm/pa1/tests/100-string-literals.t", "r", stdin);
+  //freopen("/home/syl/git/myproject/cppgm/pa1/tests/100-universal-character-name.t", "r", stdin);
+  freopen("/tmp/c/input", "r", stdin);
 
   try {
     ostringstream oss;
