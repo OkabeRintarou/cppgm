@@ -188,9 +188,6 @@ const unordered_set<int> SingleCharacter_Op_or_Punc =
         '+', '-', '*', '/', '%', '^', '&', '|', '~', '!', '=', '<', '>',
     };
 
-const unordered_set<string> MultipleCharacters_Op_or_Punc = {
-
-};
 
 enum TokenType {
   Tk_Null,
@@ -202,33 +199,6 @@ enum TokenType {
   Tk_StringLiteral,
   Tk_UserDefinedStringLiteral,
 };
-
-enum State {
-  S_None,
-  S_Id,
-  S_HeaderName,
-  S_PPNumber,
-  S_CharacterLiteral,
-  S_UserDefinedCharacterLiteral,
-  S_StringLiteral,
-  S_UserDefinedStringLiteral,
-  S_EncodingPrefiex,
-  S_OpOrPunc,
-};
-
-enum StringState {
-  Inner_None,
-  Inner_BackSlash,
-  Inner_Hex,
-  Inner_Oct1,
-  Inner_Oct2,
-  Inner_Little_U,
-  Inner_Large_U,
-};
-
-
-static const char *kMissingStringTerminator = "unterminated string literal";
-static const char *kInvalidEscapeSequence = "invalid escape sequence";
 
 
 struct Token {
@@ -246,10 +216,22 @@ static bool startsWith(const string &s, const string &prefix) {
   return strncmp(s.c_str(), prefix.c_str(), prefix.size()) == 0;
 }
 
-static bool isEncodingPrefix(const string &text) {
-  assert(!text.empty());
-  return startsWith(text, "u8") ||
-         (text.size() == 1 && (text[0] == 'u' || text[0] == 'U' || text[0] == 'L'));
+static bool isCharacterLiteralPrefix(const vector<int> &data) {
+  return data.size() == 1 && (
+      data.back() == 'u' || data.back() == 'U' || data.back() == 'L');
+}
+
+static bool isNormalStringLiteralPrefix(const vector<int> &data) {
+  auto sz = data.size();
+  return (sz == 1 && (data.front() == 'u' || data.front() == 'U' || data.front() == 'L')) ||
+         (sz == 2 && data.front() == 'u' && data.back() == '8');
+}
+
+static bool isRawStringLiteralPrefix(const vector<int> &data) {
+  auto sz = data.size();
+  return (sz == 1 && data.front() == 'R') ||
+         (sz == 2 && (data.front() == 'u' || data.front() == 'U') && data.back() == 'R') ||
+         (sz == 3 && data[0] == 'u' && data[1] == '8' && data[2] == 'R');
 }
 
 static int str2int(const string &str, int base) {
@@ -266,38 +248,83 @@ static inline bool isHex(int c) {
   return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-static string toUtf8(const string &text) {
-
-  int v = str2int(text, 16);
-  string str;
-
-  while (v > 0x7f) {
-
-  }
-
-
-  return str;
-}
 
 static int toCodePoint(const string &text) {
-  return 0;
-}
-
-static inline string littleU2Utf8(const string &text) {
-  ASSERT(text.size() == 4, "string length must be 4");
-  return toUtf8(text);
-}
-
-static inline string largeU2Utf8(const string &text) {
-  ASSERT(text.size() == 8, "string length must be 8");
-  string str;
-  str.append(toUtf8(text.substr(0, 4)));
-  str.append(toUtf8(text.substr(4, 4)));
-  return str;
+  return str2int(text, 16);
 }
 
 static inline bool isUtf8Trailing(int c) {
   return ((c >> 6) & 0x03) == 0x02;
+}
+
+static inline bool isNonDigit(int c) {
+  return (c == '_') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+static inline bool isInAnnexE1(int c) {
+  // TODO: Optimize Query Speed
+  for (const auto &p : AnnexE1_Allowed_RangesSorted) {
+    if (c >= p.first && c <= p.second) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static inline bool isInAnnexE2(int c) {
+  // TODO: Optimize Query Speed
+  for (const auto &p : AnnexE2_DisallowedInitially_RangesSorted) {
+    if (c >= p.first && c <= p.second) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static inline bool isIdentifierNonDigit(int c) {
+  return (isNonDigit(c) || isInAnnexE1(c)) && !isInAnnexE2(c);
+}
+
+static inline string codePoint2String(int c) {
+  if (c < 0 || c > 0x10FFFF) {
+    throw "invalid code point";
+  }
+  string data;
+
+  char c1, c2, c3, c4;
+  if (c >= 0 && c <= 0x7f) {
+    data.push_back(static_cast<char>(c));
+  } else if (c <= 0x7ff) {
+    c1 = static_cast<char>(((c >> 6) & 0x1f) | 0xc0);
+    c2 = static_cast<char>((c & 0x3f) | 0x80);
+    data.push_back(c1);
+    data.push_back(c2);
+  } else if (c <= 0xffff) {
+    c1 = static_cast<char>(((c >> 12) & 0x0f) | 0xe0);
+    c2 = static_cast<char>(((c >> 6) & 0x3f) | 0x80);
+    c3 = static_cast<char>((c & 0x3f) | 0x80);
+    data.push_back(c1);
+    data.push_back(c2);
+    data.push_back(c3);
+  } else {
+    c1 = static_cast<char>(((c >> 18) & 0x07) | 0xf0);
+    c2 = static_cast<char>(((c >> 12) & 0x3f) | 0x80);
+    c3 = static_cast<char>(((c >> 6) & 0x3f) | 0x80);
+    c4 = static_cast<char>((c & 0x3f) | 0x80);
+    data.push_back(c1);
+    data.push_back(c2);
+    data.push_back(c3);
+    data.push_back(c4);
+  }
+  return data;
+}
+
+static string codePoints2String(const vector<int> &cps) {
+  string data;
+  for (const int c : cps) {
+    data.append(codePoint2String(c));
+  }
+  return data;
 }
 
 
@@ -309,13 +336,13 @@ struct PPTokenizer {
   PPTokenizer(IPPTokenStream &output)
       : output(output) {
     state_ = S_None;
-    prev_token_type_ = Tk_Null;
-    string_inner_state_ = Inner_None;
+    inner_state_ = Inner_None;
     decode_state_ = D_None;
     expected_char_ = '\0';
-    is_raw_string_ = false;
-    is_prev_whitespace = false;
-    is_escape_ = false;
+    is_raw_string_mode_ = false;
+    is_prev_whitespace_ = false;
+    is_prev_pound_key_ = false;
+    is_prev_include_ = false;
   }
 
   void process(int c) {
@@ -339,11 +366,8 @@ struct PPTokenizer {
   }
 
 
-  void step(int cp) {
-    printf("%x\n", cp);
-  }
-
 private:
+
   enum DecodeState {
     D_None,
     D_UTF8,
@@ -357,6 +381,33 @@ private:
     D_InlineComment,
     D_MayEndInlineComment,
   };
+
+  enum State {
+    S_None,
+    S_Identifier,
+    S_HeaderName,
+    S_PPNumber,
+    S_PPNumberExpectSign,
+    S_StartCharacterLiteral,
+    S_EndCharacterLiteral,
+    S_UserDefinedCharacterLiteral,
+    S_StartNormalStringLiteral,
+    S_EndNormalStringLiteral,
+    S_UserDefinedNormalStringLiteral,
+    S_StartRawStringLiteral,
+    S_EndRawStringLiteral,
+    S_UserDefinedRawStringLiteral,
+    S_StartOpOrPunc,
+  };
+
+  enum InnerState {
+    Inner_None,
+    Inner_BackSlash,
+    Inner_Hex,
+    Inner_Oct1,
+    Inner_Oct2,
+  };
+
 private:
 
   bool decode(int c) {
@@ -457,10 +508,12 @@ private:
           int cp = toCodePoint(buffer_);
           code_points_.push_back(cp);
           buffer_.clear();
+          decode_state_ = D_None;
           ret = true;
         } else if (s == D_LargeU && buffer_.size() == 8) {
           // TODO: complete
           buffer_.clear();
+          decode_state_ = D_None;
           ret = true;
         }
       } else {
@@ -569,284 +622,331 @@ private:
     return ret;
   }
 
-  void emit(int c, bool cont) {
-
-    if (pending_tokens.size() == 1 && state_ == S_Id) {
-      switch (pending_tokens.front().type) {
-        case Tk_CharacterLiteral:
-          output.emit_user_defined_character_literal(pending_tokens.front().text + data_);
-        case Tk_StringLiteral:
-          output.emit_user_defined_string_literal(pending_tokens.front().text + data_);
-        default:
-          // TODO: complete
-          break;
-      }
-
-      pending_tokens.clear();
-      return;
-    }
-
-    if (!pending_tokens.empty()) {
-      // TODO: complete
-    }
-
+  void step(int cp) {
 
     switch (state_) {
-      case S_Id:
-        output.emit_identifier(data_);
+      case S_None:
+        step_None(cp);
         break;
-      case S_StringLiteral:
-        output.emit_string_literal(data_);
+      case S_Identifier:
+        step_Identifier(cp);
         break;
+      case S_PPNumber:
+        step_PPNumber(cp);
+        break;
+      case S_PPNumberExpectSign:
+        step_PPNumberExpectSign(cp);
+        break;
+      case S_StartCharacterLiteral:
+        step_StartCharacterLiteral(cp);
+        break;
+      case S_EndCharacterLiteral:
+        step_EndCharacterLiteral(cp);
+        break;
+      case S_UserDefinedCharacterLiteral:
+        step_UserDefinedCharacterLiteral(cp);
+        break;
+      case S_StartNormalStringLiteral:
+        step_StartNormalStringLiteral(cp);
+        break;
+      case S_EndNormalStringLiteral:
+        step_EndNormalStringLiteral(cp);
+        break;
+      case S_UserDefinedNormalStringLiteral:
+        step_UserDefinedNormalStringLiteral(cp);
+        break;
+      default:
+        ASSERT(false, "invalid state");
+    }
+  }
+
+  void emit(int c, bool cont) {
+
+    string data;
+
+    switch (state_) {
+      case S_Identifier: {
+        data = codePoints2String(data_);
+        output.emit_identifier(data);
+
+        if (is_prev_pound_key_) {
+          is_prev_pound_key_ = false;
+          if (data == "include") {
+            is_prev_include_ = true;
+          }
+        }
+        break;
+      }
+      case S_EndCharacterLiteral: {
+        data = codePoints2String(data_);
+        output.emit_character_literal(data);
+        break;
+      }
+      case S_UserDefinedCharacterLiteral: {
+        data = codePoints2String(data_);
+        output.emit_user_defined_string_literal(data);
+        break;
+      }
+      case S_UserDefinedNormalStringLiteral: {
+        data = codePoints2String(data_);
+        output.emit_user_defined_string_literal(data);
+        break;
+      }
+      default:
+        ASSERT(false, "invalid state");
     }
 
     state_ = S_None;
-    saved_data_ = std::move(data_);
+    data_.clear();
     if (cont) {
-      process_None(c);
+      step_None(c);
     }
   }
 
-  void emit_error(const char *msg) {
-    cerr << "ERROR: " << msg << endl;
-    exit(EXIT_FAILURE);
-  }
-
-  void process_None(int c) {
+  void step_None(int c) {
 
     ASSERT(data_.empty(), "buffer must be empty");
 
-    if (std::isspace(c) && c != 0x0A) {
-      if (!is_prev_whitespace) {
+    if (std::isspace(c) && c != LF) {
+      if (!is_prev_whitespace_) {
         output.emit_whitespace_sequence();
-        is_prev_whitespace = true;
+        is_prev_whitespace_ = true;
       }
       return;
     }
-    is_prev_whitespace = false;
+    is_prev_whitespace_ = false;
 
     if (c == EndOfFile) {
       output.emit_eof();
-    } else if (c == 0x0A) {
-      if (data_.empty() || data_.back() != '\\') {
-        output.emit_new_line();
-      }
-    } else if (c == '<' || c == '"') {
-      // header-name
-      state_ = S_HeaderName;
+    } else if (c == LF) {
+      output.emit_new_line();
+    } else if (isIdentifierNonDigit(c)) {
+      // identifier
+      state_ = S_Identifier;
       data_.push_back(c);
-
-      if (saved_data_ != "include") {
-        state_ = S_StringLiteral;
-      }
-    } else if ('.' == c || std::isdigit(c)) {
+    } else if (std::isdigit(c)) {
       // pp-number
       state_ = S_PPNumber;
       data_.push_back(c);
-    } else if (std::isalpha(c) || '_' == c) {
-      state_ = S_Id;
+    } else if ('\'' == c) {
+      // character-literal or user-defined-character-literal
+      state_ = S_StartCharacterLiteral;
       data_.push_back(c);
+    } else if ('"' == c) {
+      // string-literal or user-defined-string-literal
+      state_ = S_StartNormalStringLiteral;
+      data_.push_back(c);
+    } else if (SingleCharacter_Op_or_Punc.find(c) != SingleCharacter_Op_or_Punc.end()) {
+      // preprocessing-op-or-punc
+      state_ = S_StartOpOrPunc;
+      data_.push_back(c);
+    } else {
+      // each non-white-space character that cannot be one of the above
+      string data = codePoint2String(c);
+      output.emit_non_whitespace_char(data);
     }
   }
 
-  void process_Identifier(int c) {
-    if (std::isalnum(c) || '_' == c) {
+  void step_Identifier(int c) {
+    if (isNonDigit(c) || std::isdigit(c) || isInAnnexE1(c)) {
       data_.push_back(c);
-    } else if (c == '\'') {
-      ASSERT(!data_.empty(), "buffer length must greater than 0");
-      if (isEncodingPrefix(data_)) {
-        state_ = S_CharacterLiteral;
-        data_.push_back(c);
-      } else {
-        emit(c, true);
-      }
-    } else if (c == '"' || c == 'R') {
-      ASSERT(expected_char_ == '\0', "expected character must be zero");
-      if (isEncodingPrefix(data_)) {
-        state_ = S_StringLiteral;
-        data_.push_back(c);
-        if (c == 'R') {
-          expected_char_ = '"';
-        }
-      } else {
-        emit(c, true);
-      }
+    } else if ('\'' == c && isCharacterLiteralPrefix(data_)) {
+      data_.push_back(c);
+      state_ = S_StartCharacterLiteral;
+      inner_state_ = Inner_None;
+    } else if ('"' == c && isNormalStringLiteralPrefix(data_)) {
+      data_.push_back(c);
+      state_ = S_StartNormalStringLiteral;
+      inner_state_ = Inner_None;
+    } else if ('"' == c && isRawStringLiteralPrefix(data_)) {
+      data_.push_back(c);
+      state_ = S_StartRawStringLiteral;
+      inner_state_ = Inner_None;
     } else {
       emit(c, true);
     }
   }
 
-  void process_HeaderName(int c) {
-
-    ASSERT(!data_.empty(), "buffer length must greater than 0");
-
-    if (c == 0x0A || c == data_[0]) {
-      emit(c, false);
-    } else {
+  void step_PPNumber(int c) {
+    if (c == 'E' || c == 'e') {
       data_.push_back(c);
-    }
-  }
-
-  void process_ppnumber(int c) {
-
-  }
-
-  void process_character_literal(int c) {
-
-
-    if (c == '\'') {
+      state_ = S_PPNumberExpectSign;
+    } else if (c == '.' || std::isdigit(c) || isIdentifierNonDigit(c)) {
       data_.push_back(c);
-      emit(c, false);
-      return;
-    }
-  }
-
-  void process_string_literal(int c) {
-
-    if (is_raw_string_) {
-      process_raw_string_literal(c);
     } else {
-      process_normal_string_literal(c);
+      emit(c, true);
     }
   }
 
-  void process_normal_string_literal(int c) {
+  void step_PPNumberExpectSign(int c) {
+    if (c == '+' || c == '-') {
+      data_.push_back(c);
+      state_ = S_PPNumber;
+    } else {
+      emit(c, true);
+    }
+  }
 
-    switch (string_inner_state_) {
+  void step_StartCharacterLiteral(int c) {
+    if (LF == c) {
+      throw "unterminated character literal";
+    }
+    switch (inner_state_) {
       case Inner_None:
-        if (c == 0x0A) {
-          emit_error(kMissingStringTerminator);
+        data_.push_back(c);
+        if (c == '\'') {
+          state_ = S_EndCharacterLiteral;
         } else if (c == '\\') {
-          string_inner_state_ = Inner_BackSlash;
-        } else if (c == '\"') {
-          data_.push_back(c);
-          emit(c, false);
-        } else {
-          data_.push_back(c);
+          inner_state_ = Inner_BackSlash;
         }
         break;
       case Inner_BackSlash:
-        ASSERT(c != 0x0A, "line ending character after back slash character cannot reach here");
-        if (SimpleEscapeSequence_CodePoints.find(c) != SimpleEscapeSequence_CodePoints.end()) {
-          data_.push_back(static_cast<char>(SimpleEscapeSequence_Map.at(c)));
-        } else if (c == 'u' || c == 'U') {
-          if (c == 'u') {
-            string_inner_state_ = Inner_Little_U;
-          } else {
-            string_inner_state_ = Inner_Large_U;
-          }
-          escaped_value_.clear();
-          hex_counts_ = 0;
-        } else if (c == 'x') {
-          string_inner_state_ = Inner_Hex;
-          escaped_value_.clear();
+        data_.push_back(c);
+        if (c == 'x') {
+          inner_state_ = Inner_Hex;
+        } else if (SimpleEscapeSequence_CodePoints.find(c) != SimpleEscapeSequence_CodePoints.end()) {
+          inner_state_ = Inner_None;
         } else if (c >= '0' && c <= '7') {
-          string_inner_state_ = Inner_Oct1;
-          escaped_value_.clear();
-          escaped_value_.push_back(c);
+          inner_state_ = Inner_Oct1;
         } else {
-          data_.push_back(c);
+          throw "invalid escape sequence";
         }
         break;
       case Inner_Oct1:
         if (c >= '0' && c <= '7') {
-          string_inner_state_ = Inner_Oct2;
-          escaped_value_.push_back(c);
+          data_.push_back(c);
+          inner_state_ = Inner_Oct2;
         } else {
-          string_inner_state_ = Inner_None;
-          char b = static_cast<char>(str2int(escaped_value_, 8));
-          escaped_value_.clear();
-          data_.push_back(b);
+          inner_state_ = Inner_None;
+          step_StartCharacterLiteral(c);
         }
         break;
-      case Inner_Oct2: {
-        bool cont = false;
+      case Inner_Oct2:
+        inner_state_ = Inner_None;
         if (c >= '0' && c <= '7') {
-          escaped_value_.push_back(c);
+          data_.push_back(c);
         } else {
-          cont = true;
-        }
-        char b = static_cast<char>(str2int(escaped_value_, 8));
-        escaped_value_.clear();
-        data_.push_back(b);
-
-        string_inner_state_ = Inner_None;
-        if (cont) {
-          process_normal_string_literal(c);
-        }
-      }
-        break;
-
-      case Inner_Hex:
-        if (isHex(c)) {
-          escaped_value_.push_back(c);
-        } else {
-          char h = static_cast<char>(str2int(escaped_value_, 16));
-          escaped_value_.clear();
-          data_.push_back(h);
-
-          string_inner_state_ = Inner_None;
-          process_normal_string_literal(c);
-        }
-        break;
-      case Inner_Little_U:
-        if (isHex(c)) {
-          escaped_value_.push_back(c);
-          ++hex_counts_;
-          if (hex_counts_ == 4) {
-            data_.append(littleU2Utf8(escaped_value_));
-            string_inner_state_ = Inner_None;
-          }
-        } else {
-          emit_error(kInvalidEscapeSequence);
-        }
-
-        break;
-      case Inner_Large_U:
-        if (isHex(c)) {
-          escaped_value_.push_back(c);
-          ++hex_counts_;
-          if (hex_counts_ == 8) {
-            data_.append(largeU2Utf8(escaped_value_));
-            string_inner_state_ = Inner_None;
-          } else {
-            emit_error(kInvalidEscapeSequence);
-          }
+          step_StartCharacterLiteral(c);
         }
         break;
       default:
         ASSERT(false, "invalid inner state");
-        break;
     }
   }
 
-  void process_raw_string_literal(int c) {
+  void step_EndCharacterLiteral(int c) {
+
+    ASSERT(state_ == S_EndCharacterLiteral, "current state must be S_EndCharacterLiteral");
+
+    if (isIdentifierNonDigit(c)) {
+      data_.push_back(c);
+      state_ = S_UserDefinedCharacterLiteral;
+    } else {
+      emit(c, true);
+    }
+  }
+
+  void step_UserDefinedCharacterLiteral(int c) {
+    step_UserDefinedSuffix(c);
+  }
+
+  void step_StartNormalStringLiteral(int c) {
+    if (LF == c) {
+      throw "unterminated string literal";
+    }
+
+    switch (inner_state_) {
+      case Inner_None:
+        data_.push_back(c);
+        if (c == '"') {
+          state_ = S_EndNormalStringLiteral;
+        } else if (c == '\\') {
+          inner_state_ = Inner_BackSlash;
+        }
+        break;
+      case Inner_BackSlash:
+        data_.push_back(c);
+        if (c == 'x') {
+          inner_state_ = Inner_Hex;
+        } else if (SimpleEscapeSequence_CodePoints.find(c) != SimpleEscapeSequence_CodePoints.end()) {
+          inner_state_ = Inner_None;
+        } else if (c >= '0' && c <= '7') {
+          inner_state_ = Inner_Oct1;
+        } else {
+          throw "invalid escape sequence";
+        }
+        break;
+      case Inner_Oct1:
+        if (c >= '0' && c <= '7') {
+          data_.push_back(c);
+          inner_state_ = Inner_Oct2;
+        } else {
+          inner_state_ = Inner_None;
+          step_StartNormalStringLiteral(c);
+        }
+        break;
+      case Inner_Oct2:
+        inner_state_ = Inner_None;
+        if (c >= '0' && c <= '7') {
+          data_.push_back(c);
+        } else {
+          step_StartNormalStringLiteral(c);
+        }
+        break;
+      default:
+        ASSERT(false, "invalid inner state");
+    }
+  }
+
+  void step_EndNormalStringLiteral(int c) {
+    ASSERT(state_ == S_EndNormalStringLiteral, "current state must be S_EndNormalStringLiteral");
+
+    if (isIdentifierNonDigit(c)) {
+      data_.push_back(c);
+      state_ = S_UserDefinedNormalStringLiteral;
+    } else {
+      emit(c, true);
+    }
+  }
+
+  void step_UserDefinedNormalStringLiteral(int c) {
+    step_UserDefinedSuffix(c);
+  }
+
+  void step_StartRawStringLiteral(int c) {
 
   }
 
-private:
-  string data_;
-  string saved_data_;
+  void step_UserDefinedSuffix(int c) {
+    if (isNonDigit(c) || std::isdigit(c) || isInAnnexE1(c)) {
+      data_.push_back(c);
+    } else {
+      emit(c, true);
+    }
+  }
 
+private:
+  // variables for translation task
   string buffer_;
   int counts_;
   DecodeState decode_state_;
-  int code_point_;
   deque<int> code_points_;
   bool is_prev_back_slash_;
 
-  TokenType prev_token_type_;
-  StringState string_inner_state_;
+  // variables for tokenization task
+  vector<int> data_;
+  string saved_data_;
+
+  InnerState inner_state_;
 
   char expected_char_;
   string escaped_value_;
   int hex_counts_;
 
-  bool is_raw_string_;
-  bool is_escape_;
-  bool is_prev_whitespace;
-
-  vector<Token> pending_tokens;
+  bool is_raw_string_mode_;
+  bool is_prev_whitespace_;
+  bool is_prev_pound_key_;
+  bool is_prev_include_;
 
   State state_;
 };
@@ -867,14 +967,16 @@ int main() {
     PPTokenizer tokenizer(output);
 
     for (char c : input) {
-      unsigned char code_unit = c;
+      auto code_unit = static_cast<unsigned char>(c);
       tokenizer.process(code_unit);
     }
 
     tokenizer.process(EndOfFile);
-  }
-  catch (exception &e) {
+  } catch (exception &e) {
     cerr << "ERROR: " << e.what() << endl;
+    return EXIT_FAILURE;
+  } catch (const char *e) {
+    cerr << "ERROR: " << e << endl;
     return EXIT_FAILURE;
   }
 }
