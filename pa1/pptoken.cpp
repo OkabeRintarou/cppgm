@@ -166,55 +166,30 @@ const unordered_set<int> SimpleEscapeSequence_CodePoints =
         '\'', '"', '?', '\\', 'a', 'b', 'f', 'n', 'r', 't', 'v'
     };
 
-const unordered_map<int, int> SimpleEscapeSequence_Map =
-    {
-        {'\'', 0x27},
-        {'"',  0x22},
-        {'?',  0x3f},
-        {'\\', 0x5c},
-        {'a',  0x07},
-        {'b',  0x08},
-        {'f',  0x0c},
-        {'n',  0x0a},
-        {'r',  0x0d},
-        {'t',  0x09},
-        {'v',  0x0b},
-    };
-
 
 const unordered_set<int> SingleCharacter_Op_or_Punc =
     {
         '{', '}', '[', ']', '#', '(', ')', ';', ':', '?', '.',
-        '+', '-', '*', '/', '%', '^', '&', '|', '~', '!', '=', '<', '>',
+        '+', '-', '*', '/', '%', '^', '&', '|', '~', '!', '=', '<', '>', ',',
     };
 
+const unordered_set<string> TwoCharacter_Op_or_Punc =
+    {
+        "##", "<:", ":>", "<%", "%>", "%:", "::", ".*", "->",
+        "+=", "-=", "*=", "/=", "%=", "^=", "&=", "|=", "==",
+        "!=", "<=", ">=", "&&", "||", "<<", ">>", "++", "--",
+    };
 
-enum TokenType {
-  Tk_Null,
-  Tk_Id,
-  Tk_HeaderName,
-  Tk_PPNumber,
-  Tk_CharacterLiteral,
-  Tk_UserDefinedCharacterLiteral,
-  Tk_StringLiteral,
-  Tk_UserDefinedStringLiteral,
-};
+const unordered_set<string> ThreeCharacter_Op_or_Punc =
+    {
+        "...", "->*", "<=>", "<<=", ">>=",
+    };
 
+const unordered_set<string> FourCharacter_Op_or_Punc =
+    {
+        "%:%:",
+    };
 
-struct Token {
-  TokenType type;
-  string text;
-
-  Token(TokenType t, string txt) : type(t), text(std::move(txt)) {}
-};
-
-
-static bool startsWith(const string &s, const string &prefix) {
-  if (prefix.size() > s.size()) {
-    return false;
-  }
-  return strncmp(s.c_str(), prefix.c_str(), prefix.size()) == 0;
-}
 
 static bool isCharacterLiteralPrefix(const vector<int> &data) {
   return data.size() == 1 && (
@@ -338,11 +313,15 @@ struct PPTokenizer {
     state_ = S_None;
     inner_state_ = Inner_None;
     decode_state_ = D_None;
-    expected_char_ = '\0';
+    last_code_point_ = -1;
+    last_but_one_code_point_ = -1;
+    is_normal_string_mode_ = false;
     is_raw_string_mode_ = false;
     is_prev_whitespace_ = false;
     is_prev_pound_key_ = false;
     is_prev_include_ = false;
+    is_prev_right_paren_ = false;
+    compare_index_ = 0;
   }
 
   void process(int c) {
@@ -357,6 +336,8 @@ struct PPTokenizer {
       cp = code_points_.front();
       code_points_.pop_front();
       step(cp);
+      last_but_one_code_point_ = last_code_point_;
+      last_code_point_ = cp;
     }
 
 
@@ -394,7 +375,9 @@ private:
     S_StartNormalStringLiteral,
     S_EndNormalStringLiteral,
     S_UserDefinedNormalStringLiteral,
-    S_StartRawStringLiteral,
+    S_StartRawStringLiteralDChar,
+    S_StartRawStringLiteralRChar,
+    S_MayBeEndRawStringLiteralRChar,
     S_EndRawStringLiteral,
     S_UserDefinedRawStringLiteral,
     S_StartOpOrPunc,
@@ -410,212 +393,329 @@ private:
 
 private:
 
+  void beginUTF8State(int c) {
+    decode_state_ = D_UTF8;
+    counts_ = 0;
+
+    int shift = 7;
+    while ((shift >= 4) && ((c >> shift) & 0x01)) {
+      shift--;
+      counts_++;
+    }
+
+    if (shift < 3) {
+      throw "utf8 invalid unit (11111xx)";
+    } else if (shift > 5) {
+      throw "utf8 trailing code unit (10xxxxxx) at start";
+    } else {
+      --counts_;
+      ASSERT(buffer_.empty(), "buffer must be empty");
+      buffer_.push_back((char) (c & (~(0xff << shift))));
+    }
+  }
+
+  bool decode_None(int c) {
+    ASSERT(buffer_.empty(), "buffer must be empty");
+
+    bool ret = false;
+
+    if (c < 0x7f) {
+      if (c == '/') {
+        decode_state_ = D_ForwardSlash;
+      } else if (c == '\\') {
+        decode_state_ = D_BackSlash;
+      } else if (c == '?') {
+        decode_state_ = D_MayBeTriGraph1;
+      } else {
+        code_points_.push_back(c);
+        ret = true;
+      }
+    } else {
+      beginUTF8State(c);
+    }
+
+    return ret;
+  }
+
+  bool decode_UTF8(int c) {
+
+    bool ret = false;
+
+    if (isUtf8Trailing(c)) {
+      ASSERT(counts_ > 0, "the count of remaining trailing bytes must be greater than 0");
+      buffer_.push_back((char) (c & 0x3f));
+      --counts_;
+      if (counts_ == 0) {
+
+        auto sz = buffer_.size(), shift = 6 * (sz - 1);
+        int code = (int) (buffer_.front()) << shift;
+
+        for (auto i = 1u; i < sz; i++) {
+          shift -= 6;
+          code |= ((int) (buffer_[i]) << shift);
+        }
+        code_points_.push_back(code);
+        decode_state_ = D_None;
+        buffer_.clear();
+        ret = true;
+      }
+    } else {
+      throw "utf8 expected trailing byte (10xxxxxx)";
+    }
+
+    return ret;
+  }
+
+  bool decode_ForwardSlash(int c) {
+
+    bool ret = false;
+
+    if (is_normal_string_mode_ || is_raw_string_mode_) {
+      code_points_.push_back('/');
+      decode_state_ = D_None;
+      decode(c);
+      ret = true;
+    } else if (c == '/') {
+      // line comment
+      decode_state_ = D_SingleLineComment;
+      is_prev_back_slash_ = false;
+    } else if (c == '*') {
+      decode_state_ = D_InlineComment;
+    } else {
+      code_points_.push_back('/');
+      decode_state_ = D_None;
+      decode(c);
+      ret = true;
+    }
+
+    return ret;
+  }
+
+  bool decode_BackSlash(int c) {
+
+    bool ret = false;
+
+    if (is_raw_string_mode_) {
+      code_points_.push_back('\\');
+      decode_state_ = D_None;
+      decode(c);
+      ret = true;
+    } else if (c == LF) {
+      // line splicing
+      decode_state_ = D_None;
+    } else if (c == 'u') {
+      ASSERT(buffer_.empty(), "buffer must be empty");
+      decode_state_ = D_LittleU;
+    } else if (c == 'U') {
+      ASSERT(buffer_.empty(), "buffer must be empty");
+      decode_state_ = D_LargeU;
+    } else {
+      code_points_.push_back('\\');
+      decode_state_ = D_None;
+      decode(c);
+      ret = true;
+    }
+
+    return ret;
+  }
+
+  bool decode_UniversalCharacterName(DecodeState s, int c) {
+
+    bool ret = false;
+    // universal character name decoding
+    if (isHex(c) && !is_raw_string_mode_) {
+      buffer_.push_back(static_cast<char>(c));
+      if (s == D_LittleU && buffer_.size() == 4) {
+        int cp = toCodePoint(buffer_);
+        code_points_.push_back(cp);
+        buffer_.clear();
+        decode_state_ = D_None;
+        ret = true;
+      } else if (s == D_LargeU && buffer_.size() == 8) {
+        // TODO: complete
+        buffer_.clear();
+        decode_state_ = D_None;
+        ret = true;
+      }
+    } else {
+      code_points_.push_back('\\');
+      if (s == D_LittleU) {
+        code_points_.push_back('u');
+      } else {
+        code_points_.push_back('U');
+      }
+      string buf(buffer_);
+      buffer_.clear();
+      decode_state_ = D_None;
+      for (const auto x : buf) {
+        decode(x);
+      }
+      decode(c);
+      ret = true;
+    }
+
+    return ret;
+  }
+
+  bool decode_MayBeTriGraph1(int c) {
+
+    ASSERT(!is_raw_string_mode_, "cannot reach here if in raw string mode");
+
+    bool ret = false;
+    // tri-graph decoding
+    if (c == '?') {
+      decode_state_ = D_MayBeTriGraph2;
+    } else {
+      code_points_.push_back('?');
+      decode_state_ = D_None;
+      decode(c);
+      ret = true;
+    }
+
+    return ret;
+  }
+
+  bool decode_MayBeTriGraph2(int c) {
+
+    ASSERT(!is_raw_string_mode_, "cannot reach here if in raw string mode");
+
+    bool ret = false;
+    int cp = -1;
+
+    switch (c) {
+      case '=':
+        cp = '#';
+        break;
+      case '/':
+        cp = '\\';
+        break;
+      case '\'':
+        cp = '^';
+        break;
+      case '(':
+        cp = '[';
+        break;
+      case ')':
+        cp = ']';
+        break;
+      case '!':
+        cp = ']';
+        break;
+      case '<':
+        cp = '{';
+        break;
+      case '>':
+        cp = '}';
+        break;
+      case '-':
+        cp = '~';
+        break;
+      default:
+        code_points_.push_back('?');
+        code_points_.push_back('?');
+        decode_state_ = D_None;
+        decode(c);
+        ret = true;
+        break;
+    }
+    if (cp != -1) {
+      code_points_.push_back(cp);
+      decode_state_ = D_None;
+      ret = true;
+    }
+
+    return ret;
+  }
+
+  void decode_SingleLineComment(int c) {
+    if (c == LF) {
+      if (is_prev_back_slash_) {
+        is_prev_back_slash_ = false;
+      } else {
+        decode_state_ = D_None;
+        output.emit_whitespace_sequence();
+        output.emit_new_line();
+      }
+    } else if (c == '\\') {
+      is_prev_back_slash_ = true;
+    } else {
+      is_prev_back_slash_ = false;
+    }
+  }
+
+  void decode_InlineComment(int c) {
+    if (c == EndOfFile) {
+      throw "partial comment";
+    }
+    if (c == '*') {
+      decode_state_ = D_MayEndInlineComment;
+    }
+  }
+
+  void decode_MayEndInlineComment(int c) {
+    if (c == EndOfFile) {
+      throw "partial comment";
+    }
+    if (c == '/') {
+      decode_state_ = D_None;
+      output.emit_whitespace_sequence();
+    } else {
+      decode_state_ = D_InlineComment;
+    }
+  }
+
   bool decode(int c) {
 
     DecodeState s = decode_state_;
     bool ret = false;
 
-    if (s == D_None) {
-
-      ASSERT(buffer_.empty(), "buffer must be empty");
-
+    if (is_raw_string_mode_ && s != D_UTF8) {
       if (c < 0x7f) {
-        if (c == '/') {
-          decode_state_ = D_ForwardSlash;
-        } else if (c == '\\') {
-          decode_state_ = D_BackSlash;
-        } else if (c == '?') {
-          decode_state_ = D_MayBeTriGraph1;
-        } else {
-          code_points_.push_back(c);
-          ret = true;
-        }
-      } else {
-        decode_state_ = D_UTF8;
-        counts_ = 0;
-
-        int shift = 7;
-        while ((shift >= 4) && ((c >> shift) & 0x01)) {
-          shift--;
-          counts_++;
-        }
-
-        if (shift < 3) {
-          throw "utf8 invalid unit (11111xx)";
-        } else if (shift > 5) {
-          throw "utf8 trailing code unit (10xxxxxx) at start";
-        } else {
-          --counts_;
-          ASSERT(buffer_.empty(), "buffer must be empty");
-          buffer_.push_back((char) (c & (~(0xff << shift))));
-        }
-      }
-    } else if (s == D_UTF8) {
-      // UTF-8 decoding
-
-      if (isUtf8Trailing(c)) {
-        ASSERT(counts_ > 0, "the count of remaining trailing bytes must be greater than 0");
-        buffer_.push_back((char) (c & 0x3f));
-        --counts_;
-        if (counts_ == 0) {
-
-          auto sz = buffer_.size(), shift = 6 * (sz - 1);
-          int code = (int) (buffer_.front()) << shift;
-
-          for (auto i = 1; i < sz; i++) {
-            shift -= 6;
-            code |= ((int) (buffer_[i]) << shift);
-          }
-          code_points_.push_back(code);
-          decode_state_ = D_None;
-          buffer_.clear();
-          ret = true;
-        }
-      } else {
-        throw "utf8 expected trailing byte (10xxxxxx)";
-      }
-    } else if (s == D_ForwardSlash) {
-      if (c == '/') {
-        // line comment
-        decode_state_ = D_SingleLineComment;
-        is_prev_back_slash_ = false;
-      } else if (c == '*') {
-        decode_state_ = D_InlineComment;
-      } else {
-        code_points_.push_back('/');
-        decode_state_ = D_None;
-        ret = decode(c);
-      }
-    } else if (s == D_BackSlash) {
-      if (c == LF) {
-        // line splicing
-      } else if (c == 'u') {
-        ASSERT(buffer_.empty(), "buffer must be empty");
-        decode_state_ = D_LittleU;
-      } else if (c == 'U') {
-        ASSERT(buffer_.empty(), "buffer must be empty");
-        decode_state_ = D_LargeU;
-      } else {
-        code_points_.push_back('\\');
-        decode_state_ = D_None;
-        ret = decode(c);
-      }
-    } else if (s == D_LittleU || s == D_LargeU) {
-      // universal character name decoding
-      if (isHex(c)) {
-        buffer_.push_back(c);
-        if (s == D_LittleU && buffer_.size() == 4) {
-          int cp = toCodePoint(buffer_);
-          code_points_.push_back(cp);
-          buffer_.clear();
-          decode_state_ = D_None;
-          ret = true;
-        } else if (s == D_LargeU && buffer_.size() == 8) {
-          // TODO: complete
-          buffer_.clear();
-          decode_state_ = D_None;
-          ret = true;
-        }
-      } else {
-        code_points_.push_back('\\');
-        if (s == D_LittleU) {
-          code_points_.push_back('u');
-        } else {
-          code_points_.push_back('U');
-        }
-        string buf(buffer_);
-        buffer_.clear();
-        decode_state_ = D_None;
-        for (const auto x : buf) {
-          decode(x);
-        }
-        decode(c);
+        code_points_.push_back(c);
         ret = true;
-      }
-    } else if (s == D_MayBeTriGraph1) {
-      // tri-graph decoding
-      if (c == '?') {
-        decode_state_ = D_MayBeTriGraph2;
       } else {
-        code_points_.push_back('?');
-        decode_state_ = D_None;
-        decode(c);
-        ret = true;
+        beginUTF8State(c);
       }
-    } else if (s == D_MayBeTriGraph2) {
-      int cp = -1;
-
-      switch (c) {
-        case '=':
-          cp = '#';
-          break;
-        case '/':
-          cp = '\\';
-          break;
-        case '\'':
-          cp = '^';
-          break;
-        case '(':
-          cp = '[';
-          break;
-        case ')':
-          cp = ']';
-          break;
-        case '!':
-          cp = ']';
-          break;
-        case '<':
-          cp = '{';
-          break;
-        case '>':
-          cp = '}';
-          break;
-        case '-':
-          cp = '~';
-          break;
-        default:
-          code_points_.push_back('?');
-          code_points_.push_back('?');
-          decode_state_ = D_None;
-          decode(c);
-          ret = true;
-          break;
-      }
-      if (cp != -1) {
-        code_points_.push_back(cp);
-        decode_state_ = D_None;
-        ret = true;
-      }
-
-    } else if (s == D_SingleLineComment) {
-      if (c == LF) {
-        if (is_prev_back_slash_) {
-          is_prev_back_slash_ = false;
-        } else {
-          decode_state_ = D_None;
-        }
-      } else if (c == '\\') {
-        is_prev_back_slash_ = true;
-      } else {
-        is_prev_back_slash_ = false;
-      }
-    } else if (s == D_InlineComment) {
-      if (c == '*') {
-        decode_state_ = D_MayEndInlineComment;
-      }
-    } else if (s == D_MayEndInlineComment) {
-      if (c == '/') {
-        decode_state_ = D_None;
-      } else {
-        decode_state_ = D_InlineComment;
-      }
-    } else {
-      ASSERT(false, "invalid statement");
+      return ret;
     }
 
+    switch (s) {
+      case D_None:
+        ret = decode_None(c);
+        break;
+      case D_UTF8:
+        ret = decode_UTF8(c);
+        break;
+      case D_ForwardSlash:
+        ret = decode_ForwardSlash(c);
+        break;
+      case D_BackSlash:
+        ret = decode_BackSlash(c);
+        break;
+      case D_LittleU:
+      case D_LargeU:
+        ret = decode_UniversalCharacterName(s, c);
+        break;
+      case D_MayBeTriGraph1:
+        ret = decode_MayBeTriGraph1(c);
+        break;
+      case D_MayBeTriGraph2:
+        ret = decode_MayBeTriGraph2(c);
+        break;
+      case D_SingleLineComment:
+        decode_SingleLineComment(c);
+        break;
+      case D_InlineComment:
+        decode_InlineComment(c);
+        break;
+      case D_MayEndInlineComment:
+        decode_MayEndInlineComment(c);
+        break;
+      default:
+        ASSERT(false, "invalid statement");
+    }
 
     // file terminating line-ending
-
     if (!ret && !code_points_.empty()) {
       ret = true;
     }
@@ -637,6 +737,9 @@ private:
       case S_PPNumberExpectSign:
         step_PPNumberExpectSign(cp);
         break;
+      case S_StartOpOrPunc:
+        step_OpOrPunc(cp);
+        break;
       case S_StartCharacterLiteral:
         step_StartCharacterLiteral(cp);
         break;
@@ -655,6 +758,21 @@ private:
       case S_UserDefinedNormalStringLiteral:
         step_UserDefinedNormalStringLiteral(cp);
         break;
+      case S_StartRawStringLiteralDChar:
+        step_StartRawStringLiteralDChar(cp);
+        break;
+      case S_StartRawStringLiteralRChar:
+        step_StartRawStringLiteralRChar(cp);
+        break;
+      case S_MayBeEndRawStringLiteralRChar:
+        step_MayBeEndRawStringLiteralRChar(cp);
+        break;
+      case S_EndRawStringLiteral:
+        step_EndRawStringLiteral(cp);
+        break;
+      case S_UserDefinedRawStringLiteral:
+        step_UserDefinedRawStringLiteral(cp);
+        break;
       default:
         ASSERT(false, "invalid state");
     }
@@ -667,7 +785,12 @@ private:
     switch (state_) {
       case S_Identifier: {
         data = codePoints2String(data_);
-        output.emit_identifier(data);
+
+        if (Digraph_IdentifierLike_Operators.find(data) != Digraph_IdentifierLike_Operators.end()) {
+          output.emit_preprocessing_op_or_punc(data);
+        } else {
+          output.emit_identifier(data);
+        }
 
         if (is_prev_pound_key_) {
           is_prev_pound_key_ = false;
@@ -687,9 +810,31 @@ private:
         output.emit_user_defined_string_literal(data);
         break;
       }
-      case S_UserDefinedNormalStringLiteral: {
+
+      case S_EndNormalStringLiteral:
+      case S_EndRawStringLiteral: {
+        data = codePoints2String(data_);
+        output.emit_string_literal(data);
+        break;
+      }
+
+      case S_UserDefinedNormalStringLiteral:
+      case S_UserDefinedRawStringLiteral: {
         data = codePoints2String(data_);
         output.emit_user_defined_string_literal(data);
+        break;
+      }
+
+      case S_PPNumber:
+      case S_PPNumberExpectSign: {
+        data = codePoints2String(data_);
+        output.emit_pp_number(data);
+        break;
+      }
+
+      case S_StartOpOrPunc: {
+        data = codePoints2String(data_);
+        output.emit_preprocessing_op_or_punc(data);
         break;
       }
       default:
@@ -717,6 +862,10 @@ private:
     is_prev_whitespace_ = false;
 
     if (c == EndOfFile) {
+      if ((last_code_point_ != -1 && last_code_point_ != LF) ||
+          (last_code_point_ == LF && last_but_one_code_point_ == '\\')) {
+        output.emit_new_line();
+      }
       output.emit_eof();
     } else if (c == LF) {
       output.emit_new_line();
@@ -735,6 +884,7 @@ private:
     } else if ('"' == c) {
       // string-literal or user-defined-string-literal
       state_ = S_StartNormalStringLiteral;
+      is_normal_string_mode_ = true;
       data_.push_back(c);
     } else if (SingleCharacter_Op_or_Punc.find(c) != SingleCharacter_Op_or_Punc.end()) {
       // preprocessing-op-or-punc
@@ -757,10 +907,12 @@ private:
     } else if ('"' == c && isNormalStringLiteralPrefix(data_)) {
       data_.push_back(c);
       state_ = S_StartNormalStringLiteral;
+      is_normal_string_mode_ = true;
       inner_state_ = Inner_None;
     } else if ('"' == c && isRawStringLiteralPrefix(data_)) {
       data_.push_back(c);
-      state_ = S_StartRawStringLiteral;
+      state_ = S_StartRawStringLiteralDChar;
+      is_raw_string_mode_ = true;
       inner_state_ = Inner_None;
     } else {
       emit(c, true);
@@ -779,11 +931,72 @@ private:
   }
 
   void step_PPNumberExpectSign(int c) {
-    if (c == '+' || c == '-') {
+    if (c == '+' || c == '-' || c == '.' || std::isdigit(c) || isIdentifierNonDigit(c)) {
       data_.push_back(c);
       state_ = S_PPNumber;
     } else {
       emit(c, true);
+    }
+  }
+
+  vector<int> splitOpOrPunc(string &data, int c, bool cont) {
+    vector<int> remaining;
+
+    while (!data.empty()) {
+      if (data.size() == 4 && FourCharacter_Op_or_Punc.find(data) != FourCharacter_Op_or_Punc.end()) {
+        emit(c, cont);
+        break;
+      } else if (data.size() == 3 && ThreeCharacter_Op_or_Punc.find(data) != ThreeCharacter_Op_or_Punc.end()) {
+        remaining.push_back(data_.back());
+        data_.pop_back();
+        emit(c, cont);
+        break;
+      } else if (data.size() == 2 && TwoCharacter_Op_or_Punc.find(data) != TwoCharacter_Op_or_Punc.end()) {
+        for (int i = 0; i < 2; i++) {
+          remaining.push_back(data_.back());
+          data_.pop_back();
+        }
+        emit(c, cont);
+        break;
+      } else if (data.size() == 1 ){
+        for (int i = 0; i < 3; i++) {
+          remaining.push_back(data_.back());
+          data_.pop_back();
+        }
+        emit(c, cont);
+        break;
+      }
+
+      data.pop_back();
+    }
+  }
+
+  void step_OpOrPunc(int c) {
+
+    string data;
+    vector<int> buf;
+
+    data_.push_back(c);
+
+    if (SingleCharacter_Op_or_Punc.find(c) != SingleCharacter_Op_or_Punc.end()) {
+      data = codePoints2String(data_);
+      if (data.size() == 4) {
+        buf = splitOpOrPunc(data, c, false);
+        state_ = S_None;
+        std::reverse(buf.begin(), buf.end());
+        for (const int cp : buf) {
+          step(cp);
+        }
+      }
+    } else {
+      data_.pop_back();
+      data = codePoints2String(data_);
+      buf = splitOpOrPunc(data, c , true);
+      state_ = S_None;
+      std::reverse(buf.begin(), buf.end());
+      for (const int cp : buf) {
+        step(cp);
+      }
     }
   }
 
@@ -860,6 +1073,7 @@ private:
         data_.push_back(c);
         if (c == '"') {
           state_ = S_EndNormalStringLiteral;
+          is_normal_string_mode_ = false;
         } else if (c == '\\') {
           inner_state_ = Inner_BackSlash;
         }
@@ -913,8 +1127,91 @@ private:
     step_UserDefinedSuffix(c);
   }
 
-  void step_StartRawStringLiteral(int c) {
+  void step_StartRawStringLiteralDChar(int c) {
+    if (std::isspace(c) || c == ')' || c == '\\' || c == '"') {
+      throw "invalid characters in raw string delimiter";
+    }
+    data_.push_back(c);
+    if (c == '(') {
+      state_ = S_StartRawStringLiteralRChar;
+    } else {
+      prefix_.push_back(c);
+    }
+  }
 
+  void step_StartRawStringLiteralRChar(int c) {
+
+    ASSERT(!data_.empty(), "buffer must not be empty");
+
+    data_.push_back(c);
+
+    if (is_prev_right_paren_) {
+      if (std::isspace(c) || c == ')' || c == '(' || c == '\\') {
+        if (c != ')') {
+          is_prev_right_paren_ = false;
+        }
+      } else {
+        is_prev_right_paren_ = false;
+
+        ASSERT(compare_index_ == 0, "compare index must be zero");
+
+        if (compare_index_ == prefix_.size()) {
+          if (c == '"') {
+            state_ = S_EndRawStringLiteral;
+            is_raw_string_mode_ = false;
+          } else {
+            throw "unterminated raw string literal";
+          }
+        } else {
+          if (c == prefix_[compare_index_]) {
+            compare_index_++;
+            state_ = S_MayBeEndRawStringLiteralRChar;
+          } else {
+            compare_index_ = 0;
+          }
+        }
+      }
+    } else {
+      if (c == ')') {
+        is_prev_right_paren_ = true;
+      }
+    }
+  }
+
+  void step_MayBeEndRawStringLiteralRChar(int c) {
+
+    data_.push_back(c);
+
+    if (compare_index_ == prefix_.size()) {
+      if (c == '"') {
+        state_ = S_EndRawStringLiteral;
+        is_raw_string_mode_ = false;
+      } else {
+        compare_index_ = 0;
+        state_ = S_StartRawStringLiteralRChar;
+      }
+    } else {
+      if (c == prefix_[compare_index_]) {
+        compare_index_++;
+      } else {
+        compare_index_ = 0;
+        state_ = S_StartRawStringLiteralRChar;
+      }
+    }
+  }
+
+  void step_EndRawStringLiteral(int c) {
+
+    if (isIdentifierNonDigit(c)) {
+      data_.push_back(c);
+      state_ = S_UserDefinedNormalStringLiteral;
+    } else {
+      emit(c, true);
+    }
+  }
+
+  void step_UserDefinedRawStringLiteral(int c) {
+    step_UserDefinedSuffix(c);
   }
 
   void step_UserDefinedSuffix(int c) {
@@ -931,30 +1228,35 @@ private:
   int counts_;
   DecodeState decode_state_;
   deque<int> code_points_;
+  int last_code_point_;
+  int last_but_one_code_point_;
   bool is_prev_back_slash_;
 
   // variables for tokenization task
   vector<int> data_;
-  string saved_data_;
 
-  InnerState inner_state_;
-
-  char expected_char_;
-  string escaped_value_;
-  int hex_counts_;
-
-  bool is_raw_string_mode_;
   bool is_prev_whitespace_;
+
   bool is_prev_pound_key_;
   bool is_prev_include_;
 
+  bool is_normal_string_mode_;
+
+  // used for raw string
+  bool is_raw_string_mode_;
+  bool is_prev_right_paren_;
+  vector<int> prefix_;
+  vector<int>::size_type compare_index_;
+
+
   State state_;
+  InnerState inner_state_;
 };
 
 int main() {
 
-  //freopen("/home/syl/git/myproject/cppgm/pa1/tests/100-universal-character-name.t", "r", stdin);
-  freopen("/tmp/c/input", "r", stdin);
+  freopen("/home/syl/git/myproject/cppgm/pa1/tests/100-preprocessing-op-or-punc.t", "r", stdin);
+  //freopen("/tmp/c/input", "r", stdin);
 
   try {
     ostringstream oss;
