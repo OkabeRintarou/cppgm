@@ -1,2 +1,4 @@
-identifier 19 not_yet_implemented
+preprocessing-op-or-punc 1 .
+pp-number 5 .4214
+new-line 0 
 eof
