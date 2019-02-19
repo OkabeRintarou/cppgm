@@ -182,12 +182,12 @@ const unordered_set<string> TwoCharacter_Op_or_Punc =
 
 const unordered_set<string> ThreeCharacter_Op_or_Punc =
     {
-        "...", "->*", "<=>", "<<=", ">>=",
+        "...", "->*", "<=>", "<<=", ">>=", "<::",
     };
 
 const unordered_set<string> FourCharacter_Op_or_Punc =
     {
-        "%:%:",
+        "%:%:", "<::>", "<:::",
     };
 
 
@@ -318,6 +318,7 @@ struct PPTokenizer {
     is_normal_string_mode_ = false;
     is_raw_string_mode_ = false;
     is_prev_whitespace_ = false;
+    is_prev_new_line_ = true;
     is_prev_pound_key_ = false;
     is_prev_include_ = false;
     is_prev_right_paren_ = false;
@@ -338,6 +339,16 @@ struct PPTokenizer {
       step(cp);
       last_but_one_code_point_ = last_code_point_;
       last_code_point_ = cp;
+    }
+
+    if (c == EndOfFile) {
+      while (!code_points_.empty()) {
+        cp = code_points_.front();
+        code_points_.pop_front();
+        step(cp);
+        last_but_one_code_point_ = last_code_point_;
+        last_code_point_ = cp;
+      }
     }
 
 
@@ -479,6 +490,10 @@ private:
       // line comment
       decode_state_ = D_SingleLineComment;
       is_prev_back_slash_ = false;
+
+      if (state_ != S_None) {
+        emit(c, false);
+      }
     } else if (c == '*') {
       decode_state_ = D_InlineComment;
     } else {
@@ -532,7 +547,8 @@ private:
         decode_state_ = D_None;
         ret = true;
       } else if (s == D_LargeU && buffer_.size() == 8) {
-        // TODO: complete
+        int cp = toCodePoint(buffer_);
+        code_points_.push_back(cp);
         buffer_.clear();
         decode_state_ = D_None;
         ret = true;
@@ -599,7 +615,7 @@ private:
         cp = ']';
         break;
       case '!':
-        cp = ']';
+        cp = '|';
         break;
       case '<':
         cp = '{';
@@ -611,30 +627,43 @@ private:
         cp = '~';
         break;
       default:
-        code_points_.push_back('?');
-        code_points_.push_back('?');
-        decode_state_ = D_None;
-        decode(c);
+        if (c == '?') {
+          code_points_.push_back('?');
+        } else {
+          code_points_.push_back('?');
+          code_points_.push_back('?');
+          decode_state_ = D_None;
+          decode(c);
+        }
+
         ret = true;
         break;
     }
     if (cp != -1) {
-      code_points_.push_back(cp);
       decode_state_ = D_None;
-      ret = true;
+      if (cp == '\\') {
+        decode(cp);
+      } else {
+        code_points_.push_back(cp);
+        ret = true;
+      }
     }
 
     return ret;
   }
 
   void decode_SingleLineComment(int c) {
-    if (c == LF) {
+    if (c == EndOfFile) {
+      code_points_.push_back(' ');
+      code_points_.push_back(c);
+    } else if (c == LF) {
       if (is_prev_back_slash_) {
         is_prev_back_slash_ = false;
       } else {
         decode_state_ = D_None;
-        output.emit_whitespace_sequence();
-        output.emit_new_line();
+        code_points_.push_back(' ');
+        code_points_.push_back(LF);
+        is_prev_new_line_ = true;
       }
     } else if (c == '\\') {
       is_prev_back_slash_ = true;
@@ -658,7 +687,7 @@ private:
     }
     if (c == '/') {
       decode_state_ = D_None;
-      output.emit_whitespace_sequence();
+      code_points_.push_back(' ');
     } else {
       decode_state_ = D_InlineComment;
     }
@@ -737,6 +766,9 @@ private:
       case S_PPNumberExpectSign:
         step_PPNumberExpectSign(cp);
         break;
+      case S_HeaderName:
+        step_HeaderName(cp);
+        break;
       case S_StartOpOrPunc:
         step_OpOrPunc(cp);
         break;
@@ -800,6 +832,12 @@ private:
         }
         break;
       }
+      case S_HeaderName: {
+        data = codePoints2String(data_);
+        output.emit_header_name(data);
+        is_prev_include_ = false;
+        break;
+      }
       case S_EndCharacterLiteral: {
         data = codePoints2String(data_);
         output.emit_character_literal(data);
@@ -807,7 +845,7 @@ private:
       }
       case S_UserDefinedCharacterLiteral: {
         data = codePoints2String(data_);
-        output.emit_user_defined_string_literal(data);
+        output.emit_user_defined_character_literal(data);
         break;
       }
 
@@ -834,6 +872,10 @@ private:
 
       case S_StartOpOrPunc: {
         data = codePoints2String(data_);
+        is_prev_pound_key_ = false;
+        if (is_prev_new_line_ && data == "#") {
+          is_prev_pound_key_ = true;
+        }
         output.emit_preprocessing_op_or_punc(data);
         break;
       }
@@ -841,6 +883,7 @@ private:
         ASSERT(false, "invalid state");
     }
 
+    is_prev_new_line_ = false;
     state_ = S_None;
     data_.clear();
     if (cont) {
@@ -852,7 +895,7 @@ private:
 
     ASSERT(data_.empty(), "buffer must be empty");
 
-    if (std::isspace(c) && c != LF) {
+    if (c < 0x7f && std::isspace(c) && c != LF) {
       if (!is_prev_whitespace_) {
         output.emit_whitespace_sequence();
         is_prev_whitespace_ = true;
@@ -865,10 +908,12 @@ private:
       if ((last_code_point_ != -1 && last_code_point_ != LF) ||
           (last_code_point_ == LF && last_but_one_code_point_ == '\\')) {
         output.emit_new_line();
+        is_prev_new_line_ = true;
       }
       output.emit_eof();
     } else if (c == LF) {
       output.emit_new_line();
+      is_prev_new_line_ = true;
     } else if (isIdentifierNonDigit(c)) {
       // identifier
       state_ = S_Identifier;
@@ -883,12 +928,20 @@ private:
       data_.push_back(c);
     } else if ('"' == c) {
       // string-literal or user-defined-string-literal
-      state_ = S_StartNormalStringLiteral;
-      is_normal_string_mode_ = true;
+      if (is_prev_include_) {
+        state_ = S_HeaderName;
+      } else {
+        state_ = S_StartNormalStringLiteral;
+        is_normal_string_mode_ = true;
+      }
       data_.push_back(c);
     } else if (SingleCharacter_Op_or_Punc.find(c) != SingleCharacter_Op_or_Punc.end()) {
       // preprocessing-op-or-punc
-      state_ = S_StartOpOrPunc;
+      if (is_prev_include_) {
+        state_ = S_HeaderName;
+      } else {
+        state_ = S_StartOpOrPunc;
+      }
       data_.push_back(c);
     } else {
       // each non-white-space character that cannot be one of the above
@@ -939,36 +992,70 @@ private:
     }
   }
 
-  vector<int> splitOpOrPunc(string &data, int c, bool cont) {
+  void step_HeaderName(int c) {
+    ASSERT(!data_.empty() && (data_.front() == '<' || data_.front() == '"'),
+           "incorrect header name buffer");
+    data_.push_back(c);
+    if ((data_.front() == '<' && c == '>') || (data_.front() == '"' && c == '"')) {
+      emit(c, false);
+    }
+  }
+
+  vector<int> splitOpOrPunc(string &data, int c) {
     vector<int> remaining;
 
     while (!data.empty()) {
       if (data.size() == 4 && FourCharacter_Op_or_Punc.find(data) != FourCharacter_Op_or_Punc.end()) {
-        emit(c, cont);
+        if (data == "<::>" || data == "<:::") {
+          ASSERT(data_.size() == 4, "buffer size must be 4");
+          for (auto i = 0; i < 2; i++) {
+            remaining.push_back(data_.back());
+            data_.pop_back();
+          }
+        }
+        emit(c, false);
         break;
       } else if (data.size() == 3 && ThreeCharacter_Op_or_Punc.find(data) != ThreeCharacter_Op_or_Punc.end()) {
-        remaining.push_back(data_.back());
-        data_.pop_back();
-        emit(c, cont);
+
+        if (data == "<::") {
+          ASSERT(data_.size() >= 3, "buffer size must greater than or equal to 3");
+          for (auto i = 0; i < 2; i++) {
+            remaining.push_back(data_.back());
+            data_.pop_back();
+          }
+        }
+        while (data_.size() > 3) {
+          remaining.push_back(data_.back());
+          data_.pop_back();
+        }
+
+
+        emit(c, false);
         break;
       } else if (data.size() == 2 && TwoCharacter_Op_or_Punc.find(data) != TwoCharacter_Op_or_Punc.end()) {
-        for (int i = 0; i < 2; i++) {
+        while (data_.size() > 2) {
           remaining.push_back(data_.back());
           data_.pop_back();
         }
-        emit(c, cont);
+
+        emit(c, false);
         break;
-      } else if (data.size() == 1 ){
-        for (int i = 0; i < 3; i++) {
+      } else if (data.size() == 1) {
+        while (data_.size() > 1) {
           remaining.push_back(data_.back());
           data_.pop_back();
         }
-        emit(c, cont);
+
+        emit(c, false);
         break;
       }
 
       data.pop_back();
+      remaining.push_back(data_.back());
+      data_.pop_back();
     }
+
+    return remaining;
   }
 
   void step_OpOrPunc(int c) {
@@ -981,7 +1068,7 @@ private:
     if (SingleCharacter_Op_or_Punc.find(c) != SingleCharacter_Op_or_Punc.end()) {
       data = codePoints2String(data_);
       if (data.size() == 4) {
-        buf = splitOpOrPunc(data, c, false);
+        buf = splitOpOrPunc(data, c);
         state_ = S_None;
         std::reverse(buf.begin(), buf.end());
         for (const int cp : buf) {
@@ -990,13 +1077,20 @@ private:
       }
     } else {
       data_.pop_back();
-      data = codePoints2String(data_);
-      buf = splitOpOrPunc(data, c , true);
-      state_ = S_None;
-      std::reverse(buf.begin(), buf.end());
-      for (const int cp : buf) {
-        step(cp);
+      if (data_.size() == 1 && data_.front() == '.' && c < 0x7f && std::isdigit(c)) {
+        state_ = S_PPNumber;
+        data_.push_back(c);
+      } else {
+        data = codePoints2String(data_);
+        buf = splitOpOrPunc(data, c);
+        state_ = S_None;
+        std::reverse(buf.begin(), buf.end());
+        for (const int cp : buf) {
+          step(cp);
+        }
+        step(c);
       }
+
     }
   }
 
@@ -1237,9 +1331,12 @@ private:
 
   bool is_prev_whitespace_;
 
+  // used for header name
+  bool is_prev_new_line_;
   bool is_prev_pound_key_;
   bool is_prev_include_;
 
+  // used for normal string
   bool is_normal_string_mode_;
 
   // used for raw string
@@ -1254,9 +1351,6 @@ private:
 };
 
 int main() {
-
-  freopen("/home/syl/git/myproject/cppgm/pa1/tests/100-preprocessing-op-or-punc.t", "r", stdin);
-  //freopen("/tmp/c/input", "r", stdin);
 
   try {
     ostringstream oss;
