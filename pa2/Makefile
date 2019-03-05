@@ -1,8 +1,8 @@
 all: posttoken
 
 # build posttoken application
-posttoken: posttoken.cpp
-	g++ -g -std=gnu++11 -Wall -o posttoken posttoken.cpp
+posttoken: posttoken.cpp pptoken.cpp
+	g++ -g -std=gnu++11 -Wall -o posttoken posttoken.cpp pptoken.cpp
 
 # test posttoken application
 test: all
