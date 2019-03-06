@@ -546,6 +546,21 @@ const map<ETokenType, string> TokenTypeToStringMap =
     {OP_ARROW,           "OP_ARROW"}
   };
 
+const unordered_map<char, char> SimpleEscapeSequenceMap =
+  {
+    {'\'', '\''},
+    {'"',  '\"'},
+    {'?',  '\?'},
+    {'\\', '\\'},
+    {'a',  '\a'},
+    {'b',  '\b'},
+    {'f',  '\f'},
+    {'n',  '\n'},
+    {'r',  '\r'},
+    {'t',  '\t'},
+    {'v',  '\v'},
+  };
+
 // convert integer [0,15] to hexadecimal digit
 char ValueToHexChar(int c) {
   switch (c) {
@@ -693,8 +708,75 @@ static inline bool isHex(char c) {
   return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
-struct PostTokenizer {
+static char32_t string2CodePoint(const string &str, string::size_type &index) {
 
+  char32_t val = 0, t;
+
+  uint8_t arr[] = {0x80, 0xe0, 0xf0, 0xf8};
+  uint8_t target[] = {0x00, 0xc0, 0xe0, 0xf0};
+  int i, width = 0;
+
+  for (i = 0; i < 4; i++) {
+    if ((arr[i] & str[index]) == target[i]) {
+      width = i + 1;
+      break;
+    }
+  }
+
+  ASSERT(width > 0, "string must be valid encoded utf8");
+
+  switch (width) {
+    case 1:
+      val |= str[index];
+      break;
+    case 2:
+      val |= (str[index + 1] & 0x3f);
+      t = (char32_t) (str[index] & 0x1f);
+      val |= (t << 6);
+      break;
+    case 3:
+      val |= (str[index + 2] & 0x3f);
+      t = (char32_t) (str[index + 1] & 0x3f);
+      val |= (t << 6);
+      t = (char32_t) (str[index] & 0x1f);
+      val |= (t << 12);
+      break;
+    case 4:
+      val |= (str[index + 3] & 0x3f);
+      t = (char32_t) (str[index + 2] & 0x3f);
+      val |= (t << 6);
+      t = (char32_t) (str[index + 1] & 0x3f);
+      val |= (t << 12);
+      t = (char32_t) (str[index] & 0x07);
+      val |= (t << 18);
+      break;
+    default:
+      ASSERT(false, "never reach here");
+  }
+  index += width;
+  return val;
+}
+
+static inline bool toUnsignedLongLong(const string &str, int base, unsigned long long &val) {
+  std::size_t pos;
+  try {
+    val = std::stoull(str, &pos, base);
+    if (pos != str.size()) {
+      return false;
+    }
+  } catch (std::exception &e) {
+    return false;
+  }
+  return true;
+}
+
+struct PostException : public std::runtime_error {
+  explicit PostException(const char *str) : std::runtime_error(str) {}
+
+  explicit PostException(const string &str) : std::runtime_error(str) {}
+};
+
+struct PostTokenizer {
 
   PostTokenizer(DebugPostTokenOutputStream &out) : output(out) {}
 
@@ -712,6 +794,9 @@ struct PostTokenizer {
         break;
       case PPTokenType::Tk_HeaderName:
         process_HeaderName(token);
+        break;
+      case PPTokenType::Tk_CharacterLiteral:
+        process_CharacterLiteral(token);
         break;
       case PPTokenType::Tk_EOF:
         output.emit_eof();
@@ -817,34 +902,76 @@ private:
   }
 
   void process_PPNumber(const PPToken &token) {
-    bool valid, isFloat;
+    bool valid, isFloat, isHex, isOct;
 
     string suffix, ud_suffix;
     string::size_type index;
 
-    valid = checkNumberLiteral(token.data, isFloat, index, suffix, ud_suffix);
+    valid = checkNumberLiteral(token.data, isHex, isOct, isFloat, index, suffix, ud_suffix);
     if (!valid) {
       output.emit_invalid(token.data);
       return;
     }
 
-    bool isUser = !ud_suffix.empty();
+    ASSERT(!(!suffix.empty() && !ud_suffix.empty()),
+           "suffix and user defined suffix not be empty at the same time");
 
+    bool isUser = !ud_suffix.empty();
     EFundamentalType type;
     size_t width;
 
     string sub = token.data.substr(0, index);
-    if (isFloat) {
-      type = parseFloatType(suffix, width);
-    } else {
-      type = parseIntegerType(suffix, width);
 
+    if (isUser) {
+      if (isFloat) {
+        output.emit_user_defined_literal_floating(token.data, ud_suffix, sub);
+      } else {
+        output.emit_user_defined_literal_integer(token.data, ud_suffix, sub);
+      }
+      return;
     }
 
+    if (isFloat) {
+      type = parseFloatType(suffix, width);
+      switch (type) {
+        case FT_FLOAT: {
+          float val = PA2Decode_float(sub);
+          output.emit_literal(token.data, type, &val, width);
+        }
+          break;
+        case FT_DOUBLE: {
+          double val = PA2Decode_double(sub);
+          output.emit_literal(token.data, type, &val, width);
+        }
+          break;
+        case FT_LONG_DOUBLE: {
+          long double val = PA2Decode_long_double(sub);
+          output.emit_literal(token.data, type, &val, width);
+        }
+          break;
+        default:
+          ASSERT(false, "never reach here");
+      }
+    } else {
+      type = parseIntegerType(suffix, width);
+      int base = 10;
+      if (isHex) {
+        base = 16;
+      }
+      if (isOct) {
+        base = 8;
+      }
+      unsigned long long val;
+      if (!toUnsignedLongLong(sub, base, val)) {
+        output.emit_invalid(token.data);
+      } else {
+        output.emit_literal(token.data, type, (const void *) &val, width);
+      }
+    }
   }
 
   bool checkNumberLiteral(const string &str,
-                          bool &isFloat,
+                          bool &isHex, bool &isOct, bool &isFloat,
                           string::size_type &index,
                           string &suffix, string &ud_suffix) {
 
@@ -852,14 +979,13 @@ private:
       return false;
     }
 
-    isFloat = false;
+    isFloat = isHex = isOct = false;
     auto sz = str.size();
 
     if (sz >= 2 &&
         str[0] == '0' && (str[1] == 'x' || str[1] == 'X')) {
+      isHex = true;
       return checkHexInteger(str, index, suffix, ud_suffix);
-    } else if (str[0] == '0') {
-      return checkOctInteger(str, index, suffix, ud_suffix);
     }
 
     index = 0;
@@ -877,6 +1003,10 @@ private:
       return checkFloatExpPart(str, index, suffix, ud_suffix);
     }
 
+    if (str[0] == '0') {
+      isOct = true;
+      return checkOctInteger(str, index, suffix, ud_suffix);
+    }
     string::size_type i = index;
     if (!checkIntegerSuffix(str, i, suffix, ud_suffix)) {
       return false;
@@ -931,7 +1061,8 @@ private:
       ++index;
       return true;
     } else if (index < sz && str[index] == '_') {
-      // TODO: complete ud suffix
+      ud_suffix = str.substr(index);
+      index = str.size();
       return true;
     }
     return index == sz;
@@ -960,11 +1091,13 @@ private:
                           string &suffix, string &ud_suffix) {
     auto sz = str.size();
 
+    char long_suffix;
+
     if (index < sz && std::tolower(str[index]) == 'u') {
       suffix.push_back(str[index]);
       ++index;
 
-      char long_suffix = '\0';
+      long_suffix = '\0';
       if (index < sz && std::tolower(str[index]) == 'l') {
         long_suffix = str[index];
         suffix.push_back(str[index]);
@@ -979,12 +1112,26 @@ private:
           return false;
         }
       }
-      return true;
-    } else if (index < sz && str[index] == '_') {
+    } else if (index < sz && ((long_suffix = str[index]), std::tolower(long_suffix) == 'l')) {
+      suffix.push_back(long_suffix);
       ++index;
 
-      // TODO: check ud suffix
+      if (index < sz && std::tolower(str[index]) == 'l') {
+        if (long_suffix == str[index]) {
+          suffix.push_back(str[index]);
+          ++index;
+        } else {
+          return false;
+        }
+      }
 
+      if (index < sz && std::tolower(str[index]) == 'u') {
+        suffix.push_back(str[index]);
+        ++index;
+      }
+    } else if (index < sz && str[index] == '_') {
+      ud_suffix = str.substr(index);
+      index = str.size();
       return true;
     }
 
@@ -1012,6 +1159,84 @@ private:
     output.emit_invalid(token.data);
   }
 
+  void process_CharacterLiteral(const PPToken &token) {
+
+    EFundamentalType type;
+    int width;
+    char32_t cp;
+    string suffix;
+
+    const string &str = token.data;
+
+    try {
+      if (!checkCharacterLiteral(str, type, width, cp, suffix)) {
+        output.emit_invalid(str);
+      } else {
+        if (suffix.empty()) {
+          output.emit_literal(str, type, (const void *) &cp, (size_t) width);
+        } else {
+          output.emit_user_defined_literal_character(str, suffix, type, (const void *) &cp, (size_t) width);
+        }
+      }
+    } catch (PostException &e) {
+      cerr << e.what() << endl;
+      output.emit_invalid(token.data);
+    }
+
+  }
+
+  bool checkCharacterLiteral(const string &str,
+                             EFundamentalType &type, int &width,
+                             char32_t &cp, string &suffix) {
+    auto sz = str.size();
+    string::size_type index = 0;
+
+    if (sz < 2) {
+      return false;
+    }
+
+    type = FT_INT;
+    width = sizeof(int);
+
+    if (str[0] != '\'') {
+      return false;
+    }
+
+    if (str[1] == '\'') {
+      throw PostException("malformed character literal (#1): ''");
+    }
+
+    if (str[1] == '\\') {
+      ASSERT(sz > 3, "string size must greater than 3");
+      auto it = SimpleEscapeSequenceMap.find(str[2]);
+      ASSERT(it != SimpleEscapeSequenceMap.end(), "escape sequence must be valid");
+      type = FT_CHAR;
+      width = sizeof(char);
+      cp = (char32_t) it->second;
+      if (str[3] != '\'') {
+        throw PostException("multi code point character literals not supported: " + str);
+      }
+      index = 4;
+    } else {
+      index = 1;
+
+      cp = string2CodePoint(str, index);
+      if (cp <= 127) {
+        type = FT_CHAR;
+        width = sizeof(char);
+      }
+      if (index >= sz || str[index] != '\'') {
+        throw PostException("multi code point character literals not supported: " + str);
+      }
+      ++index;
+    }
+
+    if (index < sz && str[index] == '_') {
+      suffix = str.substr(index);
+    }
+    return true;
+  }
+
 
 private:
   DebugPostTokenOutputStream &output;
@@ -1021,7 +1246,7 @@ private:
 int main() {
 
   //freopen("input", "r", stdin);
-  freopen("/home/syl/git/myproject/cppgm/pa2/tests/200-basic-floating.t", "r", stdin);
+  freopen("/home/syl/git/myproject/cppgm/pa2/tests/200-character-literal.t", "r", stdin);
 
   try {
     ostringstream oss;
