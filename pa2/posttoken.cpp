@@ -561,8 +561,60 @@ const unordered_map<char, char> SimpleEscapeSequenceMap =
     {'v',  '\v'},
   };
 
+// given hex digit character c, return its flag
+static int HexCharToValue(int c) {
+  switch (c) {
+    case '0':
+      return 0;
+    case '1':
+      return 1;
+    case '2':
+      return 2;
+    case '3':
+      return 3;
+    case '4':
+      return 4;
+    case '5':
+      return 5;
+    case '6':
+      return 6;
+    case '7':
+      return 7;
+    case '8':
+      return 8;
+    case '9':
+      return 9;
+    case 'A':
+      return 10;
+    case 'a':
+      return 10;
+    case 'B':
+      return 11;
+    case 'b':
+      return 11;
+    case 'C':
+      return 12;
+    case 'c':
+      return 12;
+    case 'D':
+      return 13;
+    case 'd':
+      return 13;
+    case 'E':
+      return 14;
+    case 'e':
+      return 14;
+    case 'F':
+      return 15;
+    case 'f':
+      return 15;
+    default:
+      throw logic_error("HexCharToValue of nonhex char");
+  }
+}
+
 // convert integer [0,15] to hexadecimal digit
-char ValueToHexChar(int c) {
+static char ValueToHexChar(int c) {
   switch (c) {
     case 0:
       return '0';
@@ -597,7 +649,7 @@ char ValueToHexChar(int c) {
     case 15:
       return 'F';
     default:
-      throw logic_error("ValueToHexChar of nonhex value");
+      throw logic_error("ValueToHexChar of nonhex flag");
   }
 }
 
@@ -776,11 +828,125 @@ struct PostException : public std::runtime_error {
   explicit PostException(const string &str) : std::runtime_error(str) {}
 };
 
+using ULL = unsigned long long;
+
+template<typename T>
+struct fit_into {
+  explicit inline fit_into(unsigned long long val, EFundamentalType &type, size_t &width) {
+    flag = 1;
+    T v = (T) val;
+    auto t = (unsigned long long) v;
+    if (v < 0 || t != val) {
+      flag = 0;
+    } else {
+      type = FundamentalTypeOf<T>();
+      width = sizeof(T);
+    }
+  }
+
+  bool valid() const {
+    return flag != 0;
+  }
+
+private:
+  int flag;
+};
+
+
+struct fit_checker {
+  fit_checker(unsigned long long v, EFundamentalType &t, size_t &w) : val(v), type(t), width(w) {}
+
+  template<typename T>
+  inline bool check() {
+    if (fit_into<T>(val, type, width).valid()) {
+      return true;
+    }
+    return false;
+  }
+
+  unsigned long long val;
+  EFundamentalType &type;
+  size_t &width;
+};
+
+
+void type_climb(bool hasU, bool hasL, bool hasLL, bool isDec,
+                unsigned long long val, EFundamentalType &type, size_t &width) {
+
+  fit_checker checker(val, type, width);
+
+  if (hasU && hasLL) {
+    if (checker.check<unsigned long long>()) {
+      return;
+    }
+  } else if (hasLL) {
+    if (checker.check<long long int>() ||
+        (!isDec && checker.check<unsigned long long int>())) {
+      return;
+    }
+  } else if (hasU && hasL) {
+    if (checker.check<unsigned long int>() ||
+        checker.check<unsigned long long int>()) {
+      return;
+    }
+  } else if (hasL) {
+    if (isDec) {
+      if (checker.check<long int>() ||
+          checker.check<long long int>()) {
+        return;
+      }
+    } else {
+      if (checker.check<long int>() ||
+          checker.check<unsigned long int>() ||
+          checker.check<long long int>() ||
+          checker.check<unsigned long long int>()) {
+        return;
+      }
+    }
+  } else if (hasU) {
+    if (checker.check<unsigned int>() ||
+        checker.check<unsigned long int>() ||
+        checker.check<unsigned long long int>()) {
+      return;
+    }
+  } else {
+    if (isDec) {
+      if (checker.check<int>() ||
+          checker.check<long int>() ||
+          checker.check<long long int>()) {
+        return;
+      }
+    } else {
+      if (checker.check<int>() ||
+          checker.check<unsigned int>() ||
+          checker.check<long int>() ||
+          checker.check<unsigned long int>() ||
+          checker.check<long long int>() ||
+          checker.check<unsigned long long int>()) {
+        return;
+      }
+    }
+  }
+}
+
+
 struct PostTokenizer {
 
   PostTokenizer(DebugPostTokenOutputStream &out) : output(out) {}
 
   void process(const PPToken &token) {
+
+    if (!pending.empty()) {
+      if (token.type == PPTokenType::Tk_StringLiteral) {
+        pending.push_back(token);
+        return;
+      } else {
+        concat_String();
+      }
+    } else if (token.type == PPTokenType::Tk_StringLiteral) {
+      pending.push_back(token);
+      return;
+    }
 
     switch (token.type) {
       case PPTokenType::Tk_OpOrPunc:
@@ -798,6 +964,9 @@ struct PostTokenizer {
       case PPTokenType::Tk_CharacterLiteral:
         process_CharacterLiteral(token);
         break;
+      case PPTokenType::Tk_StringLiteral:
+        process_StringLiteral(token);
+        break;
       case PPTokenType::Tk_EOF:
         output.emit_eof();
         break;
@@ -807,6 +976,78 @@ struct PostTokenizer {
   }
 
 private:
+
+  void concat_String() {
+
+    unordered_set<string> prefix;
+
+    string data;
+    string source;
+
+
+    for (auto i = 0; i < pending.size(); i++) {
+      const auto &token = pending[i];
+      source += token.data;
+      if (i != pending.size() - 1) {
+        source.push_back(' ');
+      }
+    }
+
+    bool mismatched = false;
+    for (const auto &token : pending) {
+      if (process_String(token.data, prefix, mismatched, data)) {
+        output.emit_invalid(source);
+        break;
+      }
+    }
+
+    if (mismatched) {
+      cerr << "ERROR: mismatched encoding prefix in string literal sequence" << endl;
+    }
+
+    pending.clear();
+  }
+
+  bool process_String(const string &str, unordered_set<string> &prefix_set,
+                      bool &is_mismatch, string &data) {
+    auto sz = str.size();
+    string::size_type index = 0;
+
+    if (sz < 2) {
+      return false;
+    }
+
+    string prefix;
+    if (str[index] == 'U' || str[index] == 'L') {
+      prefix.push_back(str[index]);
+      ++index;
+    } else if (str[index] == 'u') {
+      prefix.push_back(str[index]);
+      ++index;
+      if (str[index] == '8') {
+        prefix.push_back(str[index]);
+        ++index;
+      }
+    }
+
+    if (!prefix.empty()) {
+      if (prefix_set.find(prefix) != prefix_set.end()) {
+        prefix_set.insert(prefix);
+      } else {
+        is_mismatch = true;
+        return false;
+      }
+    }
+
+    if (index < sz && str[index] != '"') {
+      return false;
+    }
+
+    ++index;
+
+
+  }
+
   void process_OpOrPunc(const PPToken &token) {
     if (isInvalidOperator(token.data)) {
       output.emit_invalid(token.data);
@@ -829,20 +1070,21 @@ private:
     }
   }
 
-  EFundamentalType parseIntegerType(const string &suffix, size_t &width) {
+  EFundamentalType parseIntegerType(const string &suffix, unsigned long long val,
+                                    bool isHex, bool isOct, size_t &width) {
     EFundamentalType type = FT_INT;
     width = sizeof(int);
 
-    if (!suffix.empty()) {
+    bool hasU, hasL, hasLL;
+    hasU = hasL = hasLL = false;
 
+    if (!suffix.empty()) {
       switch (suffix.size()) {
         case 1: {
           if (std::tolower(suffix[0]) == 'u') {
-            type = FT_UNSIGNED_INT;
-            width = sizeof(unsigned int);
+            hasU = true;
           } else if (std::tolower(suffix[0]) == 'l') {
-            type = FT_LONG_INT;
-            width = sizeof(long int);
+            hasL = true;
           } else {
             ASSERT(false, "never reach here");
           }
@@ -855,26 +1097,23 @@ private:
           }
 
           if (str == "ll") {
-            type = FT_LONG_LONG_INT;
-            width = sizeof(long long int);
+            hasLL = true;
           } else {
             ASSERT(str == "lu" || str == "ul", "type must be unsigned long");
-            type = FT_UNSIGNED_LONG_INT;
-            width = sizeof(unsigned long int);
+            hasU = hasL = true;
           }
         }
           break;
         case 3: {
-
-          type = FT_UNSIGNED_LONG_LONG_INT;
-          width = sizeof(unsigned long long int);
+          hasU = hasLL = true;
         }
-
           break;
         default:
           ASSERT(false, "never reach here");
       }
     }
+
+    type_climb(hasU, hasL, hasLL, !(isHex || isOct), val, type, width);
     return type;
   }
 
@@ -953,7 +1192,6 @@ private:
           ASSERT(false, "never reach here");
       }
     } else {
-      type = parseIntegerType(suffix, width);
       int base = 10;
       if (isHex) {
         base = 16;
@@ -961,10 +1199,13 @@ private:
       if (isOct) {
         base = 8;
       }
+
       unsigned long long val;
       if (!toUnsignedLongLong(sub, base, val)) {
         output.emit_invalid(token.data);
       } else {
+
+        type = parseIntegerType(suffix, val, isHex, isOct, width);
         output.emit_literal(token.data, type, (const void *) &val, width);
       }
     }
@@ -1172,16 +1413,25 @@ private:
       if (!checkCharacterLiteral(str, type, width, cp, suffix)) {
         output.emit_invalid(str);
       } else {
-        if (suffix.empty()) {
-          output.emit_literal(str, type, (const void *) &cp, (size_t) width);
+        unsigned bound = (1u << (width << 3));
+        if (bound >= 256 && cp >= bound) {
+          output.emit_invalid(str);
         } else {
-          output.emit_user_defined_literal_character(str, suffix, type, (const void *) &cp, (size_t) width);
+          if (suffix.empty()) {
+            output.emit_literal(str, type, (const void *) &cp, (size_t) width);
+          } else {
+            output.emit_user_defined_literal_character(str, suffix, type, (const void *) &cp, (size_t) width);
+          }
         }
       }
     } catch (PostException &e) {
-      cerr << e.what() << endl;
+      cerr << "ERROR: " << e.what() << endl;
       output.emit_invalid(token.data);
     }
+
+  }
+
+  void process_StringLiteral(const PPToken &token) {
 
   }
 
@@ -1198,30 +1448,104 @@ private:
     type = FT_INT;
     width = sizeof(int);
 
-    if (str[0] != '\'') {
+    if (str[index] == 'u') {
+      type = FT_CHAR16_T;
+      width = sizeof(char16_t);
+      ++index;
+    } else if (str[index] == 'U') {
+      type = FT_CHAR32_T;
+      width = sizeof(char32_t);
+      ++index;
+    } else if (str[index] == 'L') {
+      type = FT_WCHAR_T;
+      width = sizeof(wchar_t);
+      ++index;
+    }
+
+    if (str[index] != '\'') {
       return false;
     }
 
-    if (str[1] == '\'') {
+    if (str[index + 1] == '\'') {
       throw PostException("malformed character literal (#1): ''");
     }
 
-    if (str[1] == '\\') {
+
+    if (str[index + 1] == '\\') {
       ASSERT(sz > 3, "string size must greater than 3");
-      auto it = SimpleEscapeSequenceMap.find(str[2]);
-      ASSERT(it != SimpleEscapeSequenceMap.end(), "escape sequence must be valid");
-      type = FT_CHAR;
-      width = sizeof(char);
-      cp = (char32_t) it->second;
-      if (str[3] != '\'') {
-        throw PostException("multi code point character literals not supported: " + str);
+      auto it = SimpleEscapeSequenceMap.find(str[index + 2]);
+
+      if (it != SimpleEscapeSequenceMap.end()) {
+
+        if (type == FT_INT) {
+          type = FT_CHAR;
+          width = sizeof(char);
+        }
+
+        cp = (char32_t) it->second;
+        if (str[index + 3] != '\'') {
+          throw PostException("multi code point character literals not supported: " + str);
+        }
+        index += 4;
+      } else if (str[index + 2] == 'x') {
+        index += 3;
+        int val = HexCharToValue(str[index++]);
+        while (index < sz && isHex(str[index])) {
+          val = (val * 16) + HexCharToValue(str[index]);
+          if (val >= 0x110000) {
+            auto first = str.find_first_of('\'');
+            auto last = str.find_last_of('\'');
+            ASSERT(first != string::npos && last != string::npos, "string must be valid character literal");
+            string hex = str.substr(first + 1, last - first - 1);
+            throw PostException("hex escape out of range: " + std::to_string(val) + " " + hex);
+          }
+          ++index;
+        }
+
+        if (index == sz || str[index] != '\'') {
+          throw PostException("multi code point character literals not supported: " + str);
+        }
+
+        if (index < sz && str[index] == '\'') {
+          ++index;
+        }
+
+        cp = (char32_t) val;
+
+        if (val <= 127 && type == FT_INT) {
+          type = FT_CHAR;
+          width = sizeof(char);
+        }
+      } else {
+        // octal-escape-sequence
+        index += 2;
+        int val = str[index] - '0';
+        ++index;
+        while (index < sz && (str[index] >= '0' && str[index] <= '7')) {
+          val = (val * 8) + (str[index] - '0');
+          ++index;
+        }
+
+        if (index == sz || str[index] != '\'') {
+          throw PostException("multi code point character literals not supported: " + str);
+        }
+
+        if (index < sz && str[index] == '\'') {
+          ++index;
+        }
+
+        cp = (char32_t) val;
+
+        if (val <= 127 && type == FT_INT) {
+          type = FT_CHAR;
+          width = sizeof(char);
+        }
       }
-      index = 4;
     } else {
-      index = 1;
+      index += 1;
 
       cp = string2CodePoint(str, index);
-      if (cp <= 127) {
+      if (cp <= 127 && type == FT_INT) {
         type = FT_CHAR;
         width = sizeof(char);
       }
@@ -1240,13 +1564,13 @@ private:
 
 private:
   DebugPostTokenOutputStream &output;
-  std::list<PPToken> pending;
+  std::vector<PPToken> pending;
 };
 
 int main() {
 
   //freopen("input", "r", stdin);
-  freopen("/home/syl/git/myproject/cppgm/pa2/tests/200-character-literal.t", "r", stdin);
+  freopen("/home/syl/git/myproject/cppgm/pa2/tests/250-string-literal.t", "r", stdin);
 
   try {
     ostringstream oss;
