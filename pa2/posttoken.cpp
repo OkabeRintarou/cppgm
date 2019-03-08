@@ -809,6 +809,40 @@ static char32_t string2CodePoint(const string &str, string::size_type &index) {
   return val;
 }
 
+static string codePoint2String(int c) {
+  if (c < 0 || c > 0x10FFFF) {
+    throw "invalid code point";
+  }
+  string data;
+
+  char c1, c2, c3, c4;
+  if (c >= 0 && c <= 0x7f) {
+    data.push_back(static_cast<char>(c));
+  } else if (c <= 0x7ff) {
+    c1 = static_cast<char>(((c >> 6) & 0x1f) | 0xc0);
+    c2 = static_cast<char>((c & 0x3f) | 0x80);
+    data.push_back(c1);
+    data.push_back(c2);
+  } else if (c <= 0xffff) {
+    c1 = static_cast<char>(((c >> 12) & 0x0f) | 0xe0);
+    c2 = static_cast<char>(((c >> 6) & 0x3f) | 0x80);
+    c3 = static_cast<char>((c & 0x3f) | 0x80);
+    data.push_back(c1);
+    data.push_back(c2);
+    data.push_back(c3);
+  } else {
+    c1 = static_cast<char>(((c >> 18) & 0x07) | 0xf0);
+    c2 = static_cast<char>(((c >> 12) & 0x3f) | 0x80);
+    c3 = static_cast<char>(((c >> 6) & 0x3f) | 0x80);
+    c4 = static_cast<char>((c & 0x3f) | 0x80);
+    data.push_back(c1);
+    data.push_back(c2);
+    data.push_back(c3);
+    data.push_back(c4);
+  }
+  return data;
+}
+
 static inline bool toUnsignedLongLong(const string &str, int base, unsigned long long &val) {
   std::size_t pos;
   try {
@@ -937,13 +971,15 @@ struct PostTokenizer {
   void process(const PPToken &token) {
 
     if (!pending.empty()) {
-      if (token.type == PPTokenType::Tk_StringLiteral) {
+      if (token.type == PPTokenType::Tk_StringLiteral ||
+          token.type == PPTokenType::Tk_UdStringLiteral) {
         pending.push_back(token);
         return;
       } else {
         concat_String();
       }
-    } else if (token.type == PPTokenType::Tk_StringLiteral) {
+    } else if (token.type == PPTokenType::Tk_StringLiteral
+               || token.type == PPTokenType::Tk_UdStringLiteral) {
       pending.push_back(token);
       return;
     }
@@ -977,12 +1013,109 @@ struct PostTokenizer {
 
 private:
 
-  void concat_String() {
+  void advance_StringPrefix(const string &str, string::size_type &index, string &prefix) {
+    if (str[index] == 'U' || str[index] == 'L') {
+      prefix.push_back(str[index]);
+      ++index;
+    } else if (str[index] == 'u') {
+      prefix.push_back(str[index]);
+      ++index;
+      if (str[index] == '8') {
+        prefix.push_back(str[index]);
+        ++index;
+      }
+    }
+  }
 
-    unordered_set<string> prefix;
+  // escape-sequence
+  void advance_EscapeSequence(const string &str, char delimiter,
+                              string::size_type &index, string &data, int &val) {
+    const auto sz = str.size();
+    auto it = SimpleEscapeSequenceMap.find(str[index]);
+
+    if (it != SimpleEscapeSequenceMap.end()) {
+      // simple-escape-sequence
+      data.push_back(it->second);
+    } else if (str[index] == 'x') {
+      // hexadecimal-escape-sequence
+      ++index;
+      HexCharToValue(str[index]);
+      ++index;
+      while (index < sz && isHex(str[index])) {
+        val = (val * 16) + HexCharToValue(str[index]);
+        if (val >= 0x110000) {
+          auto first = str.find_first_of(delimiter);
+          auto last = str.find_last_of(delimiter);
+          ASSERT(first != string::npos && last != string::npos, "string must be included in two delimiters");
+          string hex = str.substr(first + 1, last - first - 1);
+          throw PostException("hex escape out of range: " + std::to_string(val) + " " + hex);
+        }
+        ++index;
+      }
+
+      if (delimiter == '\'' && (index == sz || str[index] == '\'')) {
+        throw PostException("multi code point character literals not supported: " + str);
+      }
+    } else {
+      // octal-escape-sequence
+
+      ASSERT(index < sz && str[index] >= '0' && str[index] <= '7', "must be valid octal escape sequence");
+      val = str[index] - '0';
+      ++index;
+
+      while (index < sz && str[index] >= '0' && str[index <= '7']) {
+        val = (val * 8) + (str[index] - '0');
+        ++index;
+      }
+
+      if (delimiter == '\'' && (index == sz || str[index] == '\'')) {
+        throw PostException("multi code point character literals not supported: " + str);
+      }
+    }
+  }
+
+
+  bool split_StringLiteral(const string &str, string &data, string &prefix) {
+
+    const auto sz = str.size();
+    string::size_type index = 0;
+    bool ret = true;
+
+    if (sz < 2) {
+      return false;
+    }
+
+    advance_StringPrefix(str, index, prefix);
+    ASSERT(index < sz && str[index] == '"', "must be \"");
+    ++index;
+
+    while (index < sz) {
+      if (str[index] == '\\') {
+        ++index;
+        try {
+          int val;
+          advance_EscapeSequence(str, '"', index, data, val);
+          data.append(codePoint2String(val));
+        } catch (const PostException &e) {
+          cerr << "ERROR: " << e.what() << endl;
+          ret = false;
+          break;
+        }
+      } else {
+        data.push_back(str[index]);
+        ++index;
+      }
+    }
+
+    return ret;
+  }
+
+  void concat_String() {
 
     string data;
     string source;
+    string prefix;
+    bool valid = true;
 
 
     for (auto i = 0; i < pending.size(); i++) {
@@ -991,15 +1124,25 @@ private:
       if (i != pending.size() - 1) {
         source.push_back(' ');
       }
+
+      if (valid) {
+        if (token.type == PPTokenType::Tk_StringLiteral) {
+          string p;
+          data.clear();
+          valid = split_StringLiteral(token.data, data, p);
+          if (valid) {
+            cout << "valid" << endl;
+          }
+        } else {
+
+        }
+      }
+
     }
 
+
     bool mismatched = false;
-    for (const auto &token : pending) {
-      if (process_String(token.data, prefix, mismatched, data)) {
-        output.emit_invalid(source);
-        break;
-      }
-    }
+
 
     if (mismatched) {
       cerr << "ERROR: mismatched encoding prefix in string literal sequence" << endl;
@@ -1007,6 +1150,7 @@ private:
 
     pending.clear();
   }
+
 
   bool process_String(const string &str, unordered_set<string> &prefix_set,
                       bool &is_mismatch, string &data) {
