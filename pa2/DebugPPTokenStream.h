@@ -261,3 +261,6 @@ private:
     tokens.emplace_back(PPToken(type, data));
   }
 };
+
+bool isNonDigit(int c);
+bool isInAnnexE1(int c);

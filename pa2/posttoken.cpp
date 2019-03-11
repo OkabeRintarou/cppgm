@@ -1610,6 +1610,44 @@ private:
     return i == sz;
   }
 
+  bool checkIsIdentifier(const string &str, string::size_type &index) {
+
+    const auto sz = str.size();
+
+    if (index >= sz) {
+      return false;
+    }
+    char ch = str[index];
+    char32_t cp;
+
+    if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || '_' == ch) {
+      ++index;
+    } else {
+      cp = string2CodePoint(str, index);
+      int c = static_cast<int>(cp);
+
+      if (!(isNonDigit(c) || std::isdigit(c) || isInAnnexE1(c))) {
+        return false;
+      }
+    }
+
+    while (index < sz) {
+      ch = str[index];
+      if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || '_' == ch || (ch >= '0' && ch <= '9')) {
+        ++index;
+      } else {
+        cp = string2CodePoint(str, index);
+        int c = static_cast<int>(cp);
+        if (!(isNonDigit(c) || std::isdigit(c) || isInAnnexE1(c))) {
+          return false;
+        }
+      }
+    }
+
+
+    return index == sz;
+  }
+
   bool checkFloatDotPart(const string &str, string::size_type &index,
                          string &suffix, string &ud_suffix) {
     auto sz = str.size();
@@ -1650,16 +1688,15 @@ private:
 
   bool checkFloatSuffix(const string &str, string::size_type &index,
                         string &suffix, string &ud_suffix) {
-    auto sz = str.size();
+    const auto sz = str.size();
 
     if (index < sz && (std::tolower(str[index]) == 'f' || std::tolower(str[index]) == 'l')) {
       suffix.push_back(str[index]);
       ++index;
-      return true;
     } else if (index < sz && str[index] == '_') {
       ud_suffix = str.substr(index);
-      index = str.size();
-      return true;
+      ++index;
+      return checkIsIdentifier(str, index);
     }
     return index == sz;
   }
@@ -1685,7 +1722,7 @@ private:
 
   bool checkIntegerSuffix(const string &str, string::size_type &index,
                           string &suffix, string &ud_suffix) {
-    auto sz = str.size();
+    const auto sz = str.size();
 
     char long_suffix;
 
@@ -1727,8 +1764,8 @@ private:
       }
     } else if (index < sz && str[index] == '_') {
       ud_suffix = str.substr(index);
-      index = str.size();
-      return true;
+      ++index;
+      return checkIsIdentifier(str, index);
     }
 
     return index == sz;
@@ -1945,8 +1982,6 @@ private:
 
 int main() {
 
-  //freopen("input", "r", stdin);
-  //freopen("/home/syl/git/myproject/cppgm/pa2/tests/400-raw-string.t", "r", stdin);
 
   try {
     ostringstream oss;

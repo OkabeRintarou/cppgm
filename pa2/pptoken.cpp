@@ -173,11 +173,11 @@ static inline bool isUtf8Trailing(int c) {
   return ((c >> 6) & 0x03) == 0x02;
 }
 
-static inline bool isNonDigit(int c) {
+inline bool isNonDigit(int c) {
   return (c == '_') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
-static inline bool isInAnnexE1(int c) {
+inline bool isInAnnexE1(int c) {
   // TODO: Optimize Query Speed
   for (const auto &p : AnnexE1_Allowed_RangesSorted) {
     if (c >= p.first && c <= p.second) {
