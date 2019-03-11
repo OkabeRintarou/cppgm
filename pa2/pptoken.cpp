@@ -34,7 +34,6 @@ using namespace std;
 constexpr int LF = 0x0A;
 
 
-
 // See C++ standard 2.11 Identifiers and Appendix/Annex E.1
 const vector<pair<int, int>> AnnexE1_Allowed_RangesSorted =
   {
@@ -1185,11 +1184,13 @@ void PPTokenizer::step_MayBeEndRawStringLiteralRChar(int c) {
   data_.push_back(c);
 
   if (compare_index_ == prefix_.size()) {
+    compare_index_ = 0;
     if (c == '"') {
       state_ = S_EndRawStringLiteral;
       is_raw_string_mode_ = false;
+      is_prev_right_paren_ = false;
+      prefix_.clear();
     } else {
-      compare_index_ = 0;
       state_ = S_StartRawStringLiteralRChar;
     }
   } else {
