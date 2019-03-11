@@ -146,7 +146,7 @@ static bool isNormalStringLiteralPrefix(const vector<int> &data) {
 static bool isRawStringLiteralPrefix(const vector<int> &data) {
   auto sz = data.size();
   return (sz == 1 && data.front() == 'R') ||
-         (sz == 2 && (data.front() == 'u' || data.front() == 'U') && data.back() == 'R') ||
+         (sz == 2 && (data.front() == 'u' || data.front() == 'U' || data.front() == 'L') && data.back() == 'R') ||
          (sz == 3 && data[0] == 'u' && data[1] == '8' && data[2] == 'R');
 }
 
