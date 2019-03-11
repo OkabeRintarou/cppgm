@@ -760,6 +760,25 @@ static inline bool isHex(char c) {
   return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
+static inline void strPush(string &str, uint16_t val) {
+  str.push_back((char) (val & 0xff));
+  str.push_back((char) ((val >> 8) & 0xff));
+}
+
+static inline void strPush(string &str, uint32_t val) {
+  str.push_back((char) (val & 0xff));
+  str.push_back((char) ((val >> 8) & 0xff));
+  str.push_back((char) ((val >> 16) & 0xff));
+  str.push_back((char) ((val >> 24) & 0xff));
+}
+
+static inline void strPush(string &str, wchar_t val) {
+  str.push_back((char) (val & 0xff));
+  str.push_back((char) ((val >> 8) & 0xff));
+  str.push_back((char) ((val >> 16) & 0xff));
+  str.push_back((char) ((val >> 24) & 0xff));
+}
+
 static char32_t string2CodePoint(const string &str, string::size_type &index) {
 
   char32_t val = 0, t;
@@ -840,6 +859,69 @@ static string codePoint2String(int c) {
     data.push_back(c3);
     data.push_back(c4);
   }
+  return data;
+}
+
+static string utf8To16(const string &str) {
+
+  const auto sz = str.size();
+  string::size_type index = 0;
+  char32_t cp;
+  uint16_t u1, u2;
+  string data;
+
+  while (index < sz) {
+    cp = string2CodePoint(str, index);
+
+    ASSERT(cp >= 0 && cp < 0x10FFFF, "code point must be no greater than 0x10FFFF");
+
+    if (cp < 0x10000) {
+      u1 = (uint16_t) cp;
+      strPush(data, u1);
+    } else {
+      cp -= 0x10000;
+      u1 = 0xD800, u2 = 0xDC00;
+      u1 |= (uint16_t) ((cp >> 10) & 0x3ff);
+      u2 |= (uint16_t) (cp & 0x3ff);
+      strPush(data, u1);
+      strPush(data, u2);
+    }
+  }
+
+  return data;
+}
+
+static string utf8To32(const string &str) {
+  const auto sz = str.size();
+  string::size_type index = 0;
+  char32_t cp;
+  uint32_t val;
+  string data;
+
+  while (index < sz) {
+    cp = string2CodePoint(str, index);
+    ASSERT(cp >= 0 && cp < 0x10FFFF, "code point must be no greater than 0x10FFFF");
+    val = static_cast<uint32_t>(cp);
+    strPush(data, val);
+  }
+
+  return data;
+}
+
+static string utf8ToWchar(const string &str) {
+  const auto sz = str.size();
+  string::size_type index = 0;
+  char32_t cp;
+  wchar_t val;
+  string data;
+
+  while (index < sz) {
+    cp = string2CodePoint(str, index);
+    ASSERT(cp >= 0 && cp < 0x10FFFF, "code point must be no greater than 0x10FFFF");
+    val = static_cast<wchar_t>(cp);
+    strPush(data, val);
+  }
+
   return data;
 }
 
@@ -961,6 +1043,7 @@ void type_climb(bool hasU, bool hasL, bool hasLL, bool isDec,
       }
     }
   }
+  throw PostException("integer constant is too large for its type");
 }
 
 
@@ -976,7 +1059,7 @@ struct PostTokenizer {
         pending.push_back(token);
         return;
       } else {
-        concat_String();
+        process_PendingStringLiteral();
       }
     } else if (token.type == PPTokenType::Tk_StringLiteral
                || token.type == PPTokenType::Tk_UdStringLiteral) {
@@ -1000,8 +1083,8 @@ struct PostTokenizer {
       case PPTokenType::Tk_CharacterLiteral:
         process_CharacterLiteral(token);
         break;
-      case PPTokenType::Tk_StringLiteral:
-        process_StringLiteral(token);
+      case PPTokenType::Tk_UdCharacterLiteral:
+        process_UdCharacterLiteral(token);
         break;
       case PPTokenType::Tk_EOF:
         output.emit_eof();
@@ -1025,21 +1108,27 @@ private:
         ++index;
       }
     }
+
+    if (str[index] == 'R') {
+      prefix.push_back(str[index]);
+      ++index;
+    }
   }
 
   // escape-sequence
   void advance_EscapeSequence(const string &str, char delimiter,
-                              string::size_type &index, string &data, int &val) {
+                              string::size_type &index, int &val) {
     const auto sz = str.size();
     auto it = SimpleEscapeSequenceMap.find(str[index]);
 
     if (it != SimpleEscapeSequenceMap.end()) {
       // simple-escape-sequence
-      data.push_back(it->second);
+      val = it->second;
+      ++index;
     } else if (str[index] == 'x') {
       // hexadecimal-escape-sequence
       ++index;
-      HexCharToValue(str[index]);
+      val = HexCharToValue(str[index]);
       ++index;
       while (index < sz && isHex(str[index])) {
         val = (val * 16) + HexCharToValue(str[index]);
@@ -1075,7 +1164,59 @@ private:
   }
 
 
-  bool split_StringLiteral(const string &str, string &data, string &prefix) {
+  bool split_StringLiteral(const string &str, string &data, string &prefix, string &err_msg) {
+
+    const auto sz = str.size();
+    string::size_type index = 0;
+    bool ret = true;
+
+    if (sz < 2) {
+      return false;
+    }
+
+    advance_StringPrefix(str, index, prefix);
+    ASSERT(index < sz && str[index] == '"', "must be \"");
+    ++index;
+
+    if (!prefix.empty() && 'R' == prefix.back()) {
+      prefix.pop_back();
+
+      auto first = str.find_first_of('(');
+      auto last = str.find_last_of(')');
+
+      ASSERT(first != string::npos && last != string::npos, "raw string must contained in ()");
+      data.append(str.substr(first + 1, last - first - 1));
+
+    } else {
+      while (index < sz) {
+        if (str[index] == '\"') {
+          ++index;
+          break;
+        }
+
+        if (str[index] == '\\') {
+          ++index;
+          try {
+            int val;
+            advance_EscapeSequence(str, '"', index, val);
+            data.append(codePoint2String(val));
+          } catch (const PostException &e) {
+            err_msg = e.what();
+            ret = false;
+            break;
+          }
+        } else {
+          data.push_back(str[index]);
+          ++index;
+        }
+      }
+    }
+
+    return ret;
+  }
+
+  bool split_UdStringLiteral(const string &str, string &data,
+                             string &prefix, string &suffix, string &err_msg) {
 
     const auto sz = str.size();
     string::size_type index = 0;
@@ -1090,14 +1231,19 @@ private:
     ++index;
 
     while (index < sz) {
+      if (str[index] == '\"') {
+        ++index;
+        break;
+      }
+
       if (str[index] == '\\') {
         ++index;
         try {
           int val;
-          advance_EscapeSequence(str, '"', index, data, val);
+          advance_EscapeSequence(str, '"', index, val);
           data.append(codePoint2String(val));
         } catch (const PostException &e) {
-          cerr << "ERROR: " << e.what() << endl;
+          err_msg = e.what();
           ret = false;
           break;
         }
@@ -1107,18 +1253,26 @@ private:
       }
     }
 
+    if (index >= sz || str[index] != '_') {
+      err_msg = "ud_suffix does not start with _: " + str;
+    } else {
+      suffix.append(str.substr(index, sz - index));
+    }
+
     return ret;
+
   }
 
-  void concat_String() {
+  void concat_String(string &source, string &data,
+                     string &suffix, string &err_msg,
+                     size_t &num_elements, EFundamentalType &type) {
 
-    string data;
-    string source;
     string prefix;
     bool valid = true;
 
+    vector<string> contents;
 
-    for (auto i = 0; i < pending.size(); i++) {
+    for (size_t i = 0; i < pending.size(); i++) {
       const auto &token = pending[i];
       source += token.data;
       if (i != pending.size() - 1) {
@@ -1126,70 +1280,122 @@ private:
       }
 
       if (valid) {
+        string p, s;
+        data.clear();
+
         if (token.type == PPTokenType::Tk_StringLiteral) {
-          string p;
-          data.clear();
-          valid = split_StringLiteral(token.data, data, p);
+
+          valid = split_StringLiteral(token.data, data, p, err_msg);
           if (valid) {
-            cout << "valid" << endl;
+            // check if has two or more different types of the four encoding-prefix
+            if (!prefix.empty() && !p.empty() && prefix != p) {
+              valid = false;
+              err_msg = "mismatched encoding prefix in string literal sequence";
+            } else if (prefix.empty() && !p.empty()) {
+              prefix = std::move(p);
+            }
+            contents.emplace_back(data);
           }
         } else {
 
+          valid = split_UdStringLiteral(token.data, data, p, s, err_msg);
+          if (valid) {
+            if (!prefix.empty() && !p.empty() && prefix != p) {
+              valid = false;
+              err_msg = "mismatched encoding prefix in string literal sequence";
+            } else if (prefix.empty() && !p.empty()) {
+              prefix = std::move(p);
+            }
+
+            // check if has two or more suffix
+            if (!suffix.empty() && !s.empty() && suffix != s) {
+              valid = false;
+              err_msg = "mismatched ud_suffix in string literal sequence";
+            } else if (suffix.empty() && !s.empty()) {
+              suffix = std::move(s);
+            }
+
+            contents.emplace_back(data);
+          }
         }
       }
 
     }
 
 
-    bool mismatched = false;
+    num_elements = 0;
+    type = FT_CHAR;
+    if (valid) {
+      // concat string
+      bool isUtf8 = false, isUtf16 = false, isUtf32 = false, isWChar = false;
+      if (!prefix.empty()) {
+        if (prefix == "u8") {
+          isUtf8 = true;
+          type = FT_CHAR;
+        } else if (prefix == "u") {
+          isUtf16 = true;
+          type = FT_CHAR16_T;
+        } else if (prefix == "U") {
+          isUtf32 = true;
+          type = FT_CHAR32_T;
+        } else {
+          isWChar = true;
+          type = FT_WCHAR_T;
+        }
+      } else {
+        isUtf8 = true;
+      }
 
+      ASSERT(isUtf8 || isUtf16 || isUtf32 || isWChar, "at least one must be true");
 
-    if (mismatched) {
-      cerr << "ERROR: mismatched encoding prefix in string literal sequence" << endl;
+      data.clear();
+      contents.back().push_back('\0');
+      for (const auto &content : contents) {
+        if (isUtf8) {
+          data.append(content);
+        } else if (isUtf16) {
+          data.append(utf8To16(content));
+        } else if (isUtf32) {
+          data.append(utf8To32(content));
+        } else {
+          data.append(utf8ToWchar(content));
+        }
+      }
+
+      if (isUtf8) {
+        num_elements = data.size();
+      } else if (isUtf16) {
+        ASSERT((data.size() % 2) == 0, "size must be divided by 2");
+        num_elements = data.size() / 2;
+      } else if (isUtf32) {
+        ASSERT((data.size() % 4) == 0, "size must be divided by 4");
+        num_elements = data.size() / 4;
+      } else {
+        ASSERT((data.size() % 4) == 0, "size must be divided by 4");
+        num_elements = data.size() / 4;
+      }
+
     }
 
     pending.clear();
   }
 
 
-  bool process_String(const string &str, unordered_set<string> &prefix_set,
-                      bool &is_mismatch, string &data) {
-    auto sz = str.size();
-    string::size_type index = 0;
-
-    if (sz < 2) {
-      return false;
+  void process_PendingStringLiteral() {
+    string source, data, suffix, err_msg;
+    size_t num_elements;
+    EFundamentalType type;
+    concat_String(source, data, suffix, err_msg, num_elements, type);
+    if (!err_msg.empty()) {
+      output.emit_invalid(source);
+      cerr << "ERROR: " << err_msg << endl;
+    } else if (suffix.empty()) {
+      output.emit_literal_array(source, num_elements, type, (const void *) data.c_str(), data.size());
+    } else {
+      output.emit_user_defined_literal_string_array(source, suffix,
+                                                    num_elements, type,
+                                                    (const void *) data.c_str(), data.size());
     }
-
-    string prefix;
-    if (str[index] == 'U' || str[index] == 'L') {
-      prefix.push_back(str[index]);
-      ++index;
-    } else if (str[index] == 'u') {
-      prefix.push_back(str[index]);
-      ++index;
-      if (str[index] == '8') {
-        prefix.push_back(str[index]);
-        ++index;
-      }
-    }
-
-    if (!prefix.empty()) {
-      if (prefix_set.find(prefix) != prefix_set.end()) {
-        prefix_set.insert(prefix);
-      } else {
-        is_mismatch = true;
-        return false;
-      }
-    }
-
-    if (index < sz && str[index] != '"') {
-      return false;
-    }
-
-    ++index;
-
-
   }
 
   void process_OpOrPunc(const PPToken &token) {
@@ -1349,8 +1555,13 @@ private:
         output.emit_invalid(token.data);
       } else {
 
-        type = parseIntegerType(suffix, val, isHex, isOct, width);
-        output.emit_literal(token.data, type, (const void *) &val, width);
+        try {
+          type = parseIntegerType(suffix, val, isHex, isOct, width);
+          output.emit_literal(token.data, type, (const void *) &val, width);
+        } catch (const PostException &e) {
+          output.emit_invalid(token.data);
+          cerr << "ERROR: " << e.what() << endl;
+        }
       }
     }
   }
@@ -1554,18 +1765,14 @@ private:
     const string &str = token.data;
 
     try {
-      if (!checkCharacterLiteral(str, type, width, cp, suffix)) {
+      if (!checkCharacterLiteral(str, type, width, cp, false, suffix)) {
         output.emit_invalid(str);
       } else {
         unsigned bound = (1u << (width << 3));
         if (bound >= 256 && cp >= bound) {
           output.emit_invalid(str);
         } else {
-          if (suffix.empty()) {
-            output.emit_literal(str, type, (const void *) &cp, (size_t) width);
-          } else {
-            output.emit_user_defined_literal_character(str, suffix, type, (const void *) &cp, (size_t) width);
-          }
+          output.emit_literal(str, type, (const void *) &cp, (size_t) width);
         }
       }
     } catch (PostException &e) {
@@ -1575,13 +1782,34 @@ private:
 
   }
 
-  void process_StringLiteral(const PPToken &token) {
+  void process_UdCharacterLiteral(const PPToken &token) {
+    EFundamentalType type;
+    int width;
+    char32_t cp;
+    string suffix;
 
+    const string &str = token.data;
+
+    try {
+      if (!checkCharacterLiteral(str, type, width, cp, true, suffix)) {
+        output.emit_invalid(str);
+      } else {
+        unsigned bound = (1u << (width << 3));
+        if (bound >= 256 && cp >= bound) {
+          output.emit_invalid(str);
+        } else {
+          output.emit_user_defined_literal_character(str, suffix, type, (const void *) &cp, (size_t) width);
+        }
+      }
+    } catch (PostException &e) {
+      cerr << "ERROR: " << e.what() << endl;
+      output.emit_invalid(token.data);
+    }
   }
 
   bool checkCharacterLiteral(const string &str,
                              EFundamentalType &type, int &width,
-                             char32_t &cp, string &suffix) {
+                             char32_t &cp, bool check_suffix, string &suffix) {
     auto sz = str.size();
     string::size_type index = 0;
 
@@ -1699,8 +1927,12 @@ private:
       ++index;
     }
 
-    if (index < sz && str[index] == '_') {
-      suffix = str.substr(index);
+    if (check_suffix && index < sz) {
+      if (str[index] == '_') {
+        suffix = str.substr(index);
+      } else {
+        throw PostException("ud_suffix does not start with _: " + str);
+      }
     }
     return true;
   }
@@ -1714,7 +1946,7 @@ private:
 int main() {
 
   //freopen("input", "r", stdin);
-  freopen("/home/syl/git/myproject/cppgm/pa2/tests/250-string-literal.t", "r", stdin);
+  //freopen("/home/syl/git/myproject/cppgm/pa2/tests/400-raw-string.t", "r", stdin);
 
   try {
     ostringstream oss;
